@@ -11,11 +11,11 @@ readonly PROOF_ROOT="$(git rev-parse --show-toplevel)"
 readonly EVIDENCE="${M8_PROOF_EVIDENCE_DIR:-$PROOF_ROOT/proof-artifacts}"
 readonly CANDIDATE="$PROOF_ROOT/candidate"
 
-# Exact Product binding for the M8-EXI-F01 test-only successor candidate.
+# Exact Product binding for the M8-HSDR-F02 test-only successor candidate.
 readonly APP_BRANCH='m8-alignment-connector-obstacle-avoiding-routing'
-readonly APP_SHA='e4b1cc66f540ab74c0ef9bd014b0a0da3a2d9c1d'
-readonly APP_TREE='6cf77af6fb8ef029370a5ec9a67680c5823d2133'
-readonly APP_PARENT='078d3ed11f33716578bcee6a3f4801319c79fe8d'
+readonly APP_SHA='2441f9cf60b7cc9402c5b257be010b559b39b717'
+readonly APP_TREE='5d1b7c7cc104cd365b0ea629d9ead7677d17f2be'
+readonly APP_PARENT='e4b1cc66f540ab74c0ef9bd014b0a0da3a2d9c1d'
 readonly MAIN_SHA='cf26ea557bd746a518ff32b8b7e7a7542be7f7ae'
 readonly ALEMBIC_HEAD='0006'
 readonly APP_URL='https://github.com/Pacchifans69/LinguaGraph.git'

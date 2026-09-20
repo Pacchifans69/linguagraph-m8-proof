@@ -33,9 +33,9 @@ for this successor.
 ```text
 repository:     Pacchifans69/LinguaGraph
 branch:         m8-alignment-connector-obstacle-avoiding-routing
-candidate SHA:  e4b1cc66f540ab74c0ef9bd014b0a0da3a2d9c1d
-candidate tree: 6cf77af6fb8ef029370a5ec9a67680c5823d2133
-unique parent:  078d3ed11f33716578bcee6a3f4801319c79fe8d
+candidate SHA:  2441f9cf60b7cc9402c5b257be010b559b39b717
+candidate tree: 5d1b7c7cc104cd365b0ea629d9ead7677d17f2be
+unique parent:  e4b1cc66f540ab74c0ef9bd014b0a0da3a2d9c1d
 frozen main:    cf26ea557bd746a518ff32b8b7e7a7542be7f7ae
 Alembic head:   0006
 ```

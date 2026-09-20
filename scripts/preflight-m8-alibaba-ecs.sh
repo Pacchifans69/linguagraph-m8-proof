@@ -11,7 +11,7 @@ readonly IMDS_TTL='21600'
 readonly PRODUCT_URL='https://github.com/Pacchifans69/LinguaGraph.git'
 readonly PROOF_URL='https://github.com/Pacchifans69/linguagraph-m8-proof.git'
 readonly PRODUCT_BRANCH='m8-alignment-connector-obstacle-avoiding-routing'
-readonly PRODUCT_SHA='e4b1cc66f540ab74c0ef9bd014b0a0da3a2d9c1d'
+readonly PRODUCT_SHA='2441f9cf60b7cc9402c5b257be010b559b39b717'
 readonly PRODUCT_MAIN='cf26ea557bd746a518ff32b8b7e7a7542be7f7ae'
 
 die() { printf 'PREFLIGHT_FAIL: %s\n' "$*" >&2; exit 1; }
