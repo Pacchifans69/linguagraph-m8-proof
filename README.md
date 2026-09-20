@@ -129,3 +129,18 @@ NO merge
 NO reuse of M6/M7 run authorization
 NO unreviewed provider identity substitution
 ```
+
+## Alibaba ECS provider-binding preflight
+
+After this preparation source is independently audited, clone the exact proof
+repository on the intended ECS host and run:
+
+```bash
+bash scripts/preflight-m8-alibaba-ecs.sh
+```
+
+The preflight is discovery-only. It does not install packages, bootstrap
+Docker, consume a one-shot run authorization, create formal proof evidence, or
+mutate either GitHub repository. Paste its complete output back to the Human
+review channel. The immutable instance/region/zone/type/image tuple must be
+reviewed before any provider-binding commit is prepared.
