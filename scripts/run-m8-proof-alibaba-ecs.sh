@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # M8-EXI-01 Alibaba ECS thin adapter.
 #
-# Preparation source only. Product pins and one-shot/replay protections are
-# frozen, but the Alibaba provider identity is deliberately UNBOUND. Formal
-# execution is impossible until a later Human-reviewed provider-binding commit
-# replaces the UNBOUND sentinels, flips PROVIDER_BINDING_READY to YES, and that
-# exact proof source receives a fresh one-shot Human run authorization.
+# Provider-bound M8 proof source. Product pins and one-shot/replay protections
+# remain frozen. The Alibaba provider identity below was established by the
+# read-only M8-EXI-01 preflight on 2026-09-20T08:11:52Z. Formal execution still
+# requires Human approval of this exact proof commit and a fresh one-shot M8
+# run authorization.
 set -Eeuo pipefail
 
 readonly PROOF_ROOT="$(git rev-parse --show-toplevel)"
@@ -39,13 +39,15 @@ readonly IMDS_TTL='21600'
 # Exact fresh provider binding established by the separately authorized M8
 # successor P3A/P3B/P3C provider preflight. Keep this fail-closed: do not replace
 # these constants with wildcards or runtime-supplied arbitrary host identity.
-readonly EXPECTED_INSTANCE_ID='UNBOUND'
-readonly EXPECTED_REGION_ID='UNBOUND'
-readonly EXPECTED_ZONE_ID='UNBOUND'
-readonly EXPECTED_INSTANCE_TYPE='UNBOUND'
-readonly EXPECTED_IMAGE_ID='UNBOUND'
+readonly EXPECTED_INSTANCE_ID='i-j6c9854oyawy89fcdxy2'
+readonly EXPECTED_REGION_ID='cn-hongkong'
+readonly EXPECTED_ZONE_ID='cn-hongkong-d'
+readonly EXPECTED_INSTANCE_TYPE='ecs.g9i.xlarge'
+readonly EXPECTED_IMAGE_ID='ubuntu_24_04_x64_20G_alibase_20260916.vhd'
+readonly EXPECTED_IDENTITY_DOCUMENT_SHA256='60f62ad9f4c10aab718bdc6dfdf0c57e1e4ced293908417009df8e4b7dbdaa1d'
+readonly EXPECTED_IDENTITY_PKCS7_SHA256='89185b286e03b344a5ca7e2f3a242baf4b454419dab0cd83ec3426981860d211'
 
-readonly PROVIDER_BINDING_READY='NO'
+readonly PROVIDER_BINDING_READY='YES'
 readonly RUN_AUTH_NAMESPACE_DESCRIPTION='M8-EXI-01-RUN-<approved-proof-sha-prefix>-<nonce>'
 
 IMDS_TOKEN=''
@@ -287,6 +289,8 @@ guard_and_capture_imds() {
 
   sha256sum "$EVIDENCE/instance-identity-document.json" | cut -d' ' -f1 > "$EVIDENCE/instance-identity-document.sha256"
   sha256sum "$EVIDENCE/instance-identity-pkcs7.txt" | cut -d' ' -f1 > "$EVIDENCE/instance-identity-pkcs7.sha256"
+  expect "$(cat "$EVIDENCE/instance-identity-document.sha256")" "$EXPECTED_IDENTITY_DOCUMENT_SHA256" identity_document_sha256
+  expect "$(cat "$EVIDENCE/instance-identity-pkcs7.sha256")" "$EXPECTED_IDENTITY_PKCS7_SHA256" identity_pkcs7_sha256
 
   {
     printf 'os_release:\n'

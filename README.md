@@ -9,8 +9,8 @@ Product repository.
 ```text
 checkpoint:           M8
 proof path:           M8-EXI-01 — Alibaba ECS alternate hosted Gate 2
-proof source:         PREPARED
-provider binding:     NOT YET ESTABLISHED
+proof source:         PROVIDER-BOUND
+provider binding:     ESTABLISHED / REVIEWED
 formal run auth:      NOT ISSUED
 formal execution:     NOT EXECUTED
 Gate 2:               NOT ESTABLISHED
@@ -95,26 +95,42 @@ authorization:      M8-EXI-01-RUN-<approved-proof-sha-prefix>-<nonce>
 
 No M6/M7 authorization or spent-token namespace is valid here.
 
-## Provider binding boundary
+## Provider binding
 
-This preparation source is intentionally **not executable as a formal Alibaba
-proof**. The adapter contains `PROVIDER_BINDING_READY=NO` and immutable provider
-identity fields set to `UNBOUND`.
-
-The next stage is an independent static audit of this proof-source commit, then
-a live Alibaba ECS preflight that establishes exact immutable identity:
+The read-only Alibaba ECS preflight passed at
+`2026-09-20T08:11:52Z` and established the reviewed immutable execution
+identity:
 
 ```text
-instance ID
-region
-zone
-instance type
-image ID
+instance ID:   i-j6c9854oyawy89fcdxy2
+region:        cn-hongkong
+zone:          cn-hongkong-d
+instance type: ecs.g9i.xlarge
+image ID:      ubuntu_24_04_x64_20G_alibase_20260916.vhd
 ```
 
-A later bounded proof-repo commit may bind only that reviewed identity. Formal
-execution still requires separate Human approval of the resulting exact proof
-SHA/tree and a fresh one-shot M8 run authorization.
+Additional observed provenance:
+
+```text
+identity document SHA-256:
+60f62ad9f4c10aab718bdc6dfdf0c57e1e4ced293908417009df8e4b7dbdaa1d
+
+identity PKCS7 SHA-256:
+89185b286e03b344a5ca7e2f3a242baf4b454419dab0cd83ec3426981860d211
+
+VPC:           vpc-j6cgz9a4frhl3oxxbecsj
+vSwitch:       vsw-j6c9f1ch565yr60wzx2rc
+private IPv4:  172.23.68.216
+EIP:           47.238.211.55
+```
+
+The adapter now fails closed unless the immutable provider tuple and identity
+hashes match these reviewed values. Network addresses are recorded as
+provenance but are not used as immutable execution identity.
+
+Formal execution is still **not authorized**. It requires separate Human
+approval of the resulting exact proof SHA/tree and a fresh one-shot M8 run
+authorization.
 
 ## Mutation boundary
 
@@ -141,6 +157,6 @@ bash scripts/preflight-m8-alibaba-ecs.sh
 
 The preflight is discovery-only. It does not install packages, bootstrap
 Docker, consume a one-shot run authorization, create formal proof evidence, or
-mutate either GitHub repository. Paste its complete output back to the Human
-review channel. The immutable instance/region/zone/type/image tuple must be
-reviewed before any provider-binding commit is prepared.
+mutate either GitHub repository. The reviewed preflight above is now the
+provider-binding authority for this proof source. Re-running it is diagnostic
+only and does not itself authorize formal execution.
