@@ -9,26 +9,33 @@ Product repository.
 ```text
 checkpoint:           M8
 proof path:           M8-EXI-01 — Alibaba ECS alternate hosted Gate 2
-proof source:         PROVIDER-BOUND
+proof source:         SUCCESSOR-REBOUND / PROVIDER-BOUND
 provider binding:     ESTABLISHED / REVIEWED
-formal run auth:      NOT ISSUED
-formal execution:     NOT EXECUTED
+prior formal run:     PREDECESSOR FAILED 33/34 PLAYWRIGHT / AUTH SPENT
+formal run auth:      NOT ISSUED FOR SUCCESSOR
+successor execution:  NOT EXECUTED
 Gate 2:               NOT ESTABLISHED
 ```
 
-The Product's canonical GitHub Actions run for this exact candidate was retried
-and again failed before every repository-defined step (`runner_id=0`,
+The Product's canonical GitHub Actions run for this exact successor candidate
+again failed before every repository-defined step (`runner_id=0`,
 `runner_name=""`, `steps=[]`). That is provider/pre-step diagnostic evidence,
 not application/test evidence.
+
+The predecessor candidate `078d3ed11f33716578bcee6a3f4801319c79fe8d` completed one formal hosted
+proof attempt: all backend, migration, routing, Vitest, and build evidence passed,
+while Playwright finished 33/34 on a body-scroll assertion later classified as a
+contract false positive. Its one-shot authorization is spent and is not valid
+for this successor.
 
 ## Exact Product binding
 
 ```text
 repository:     Pacchifans69/LinguaGraph
 branch:         m8-alignment-connector-obstacle-avoiding-routing
-candidate SHA:  078d3ed11f33716578bcee6a3f4801319c79fe8d
-candidate tree: 2d7903158406349cc2c70d45b5cf496e4b2bf495
-unique parent:  72398371c605f909ff8f02aedcc521e8c2ba6a23
+candidate SHA:  e4b1cc66f540ab74c0ef9bd014b0a0da3a2d9c1d
+candidate tree: 6cf77af6fb8ef029370a5ec9a67680c5823d2133
+unique parent:  078d3ed11f33716578bcee6a3f4801319c79fe8d
 frozen main:    cf26ea557bd746a518ff32b8b7e7a7542be7f7ae
 Alembic head:   0006
 ```
@@ -128,9 +135,10 @@ The adapter now fails closed unless the immutable provider tuple and identity
 hashes match these reviewed values. Network addresses are recorded as
 provenance but are not used as immutable execution identity.
 
-Formal execution is still **not authorized**. It requires separate Human
-approval of the resulting exact proof SHA/tree and a fresh one-shot M8 run
-authorization.
+Formal execution of the successor is still **not authorized**. It requires
+separate Human approval of the rebound exact proof SHA/tree and a fresh one-shot
+M8 run authorization. The predecessor authorization remains spent and must not
+be reused.
 
 ## Mutation boundary
 
