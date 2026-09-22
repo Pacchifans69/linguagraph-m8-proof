@@ -29,6 +29,7 @@ claim_sha256
 claim_object
 issued_object
 issued_document_sha256
+oss_trust_profile_sha256
 proof_sha
 proof_tree
 candidate_sha
@@ -63,4 +64,5 @@ cross_binding.sealed_archive_sha256
 cross_binding.package_index_archive_sha256
 cross_binding.manifest_sha256
 cross_binding.issued_document_sha256
+cross_binding.oss_trust_profile_sha256
 cross_binding.claim_object_sha256

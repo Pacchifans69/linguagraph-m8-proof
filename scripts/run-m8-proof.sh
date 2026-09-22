@@ -85,6 +85,14 @@ SEMANTIC_AUTH_SHA256=''
 RETRY_AUTH_SHA256='null'
 ISSUED_OBJECT=''
 ISSUED_DOCUMENT_SHA256=''
+# --- R2I-C4 / B03 OSS trust target (all values derived at runtime) ----------
+OSS_TRUST_PROFILE_SHA256=''
+OSSUTIL_ABSOLUTE_PATH=''
+OSSUTIL_VERSION=''
+OSSUTIL_BINARY_SHA256=''
+ECS_ROLE_NAME=''
+ENVIRONMENT_GUARD_STATE='NOT_RUN'
+ISSUED_PROFILE_SHA256=''
 CLAIM_OBJECT=''
 CLAIM_SHA256=''
 RUN_PREFIX=''
@@ -313,7 +321,7 @@ if doc.get("authorization_kind") != kind:
 
 common = [
     "schema", "authorization_kind", "authorization_id",
-    "authorization_sha256", "proof_sha", "proof_tree",
+    "authorization_sha256", "oss_trust_profile_sha256", "proof_sha", "proof_tree",
     "candidate_sha", "candidate_tree", "candidate_parent", "frozen_main",
     "provider_identity", "authorized_executor_id", "single_use", "issued_utc",
 ]
@@ -346,6 +354,9 @@ require_sha("candidate_tree", sha40, "40-hex tree SHA")
 # contain a correct digest of its own bytes, so there is no self-reference and
 # no issued-document digest is accepted from inside the document.
 require_sha("authorization_sha256", sha64, "64-hex SHA-256")
+
+# R2I-C4/B03: every issued authorization must ALSO bind the OSS trust profile.
+require_sha("oss_trust_profile_sha256", sha64, "64-hex OSS trust-profile SHA-256")
 
 if kind == "DURABILITY_RETRY":
     for field in ("semantic_auth_sha256", "archive_sha256", "package_index_sha256"):
@@ -405,6 +416,15 @@ m8_load_authorization() {
   fi
 
   m8_validate_authorization_structure "$issued_local" "$AUTHORIZATION_KIND" || return 1
+
+  # R2I-C4/B03: the Human-issued authorization binds the exact OSS trust profile.
+  # Missing, malformed or mismatched => FAIL CLOSED before claim creation.
+  ISSUED_PROFILE_SHA256="$(m8_json_get "$issued_local" oss_trust_profile_sha256)"
+  [[ "$ISSUED_PROFILE_SHA256" =~ ^[0-9a-f]{64}$ ]] ||
+    { m8_die 'issued.json oss_trust_profile_sha256 is not a SHA-256'; return 1; }
+  [[ -n "$OSS_TRUST_PROFILE_SHA256" ]] ||
+    { m8_die 'local OSS trust profile digest has not been established'; return 1; }
+  m8_expect "$ISSUED_PROFILE_SHA256" "$OSS_TRUST_PROFILE_SHA256" issued_oss_trust_profile_sha256 || return 1
 
   # The authorization identity is SHA256(exact Human-issued TOKEN); it is NOT a
   # digest of the issued document. There is no self-reference: the document must
@@ -478,7 +498,8 @@ m8_validate_receipt_against_authorization() {
     --receipt "$receipt" \
     --expect-proof-sha "$APPROVED_PROOF_SHA" \
     --expect-candidate-sha "$M8_APP_SHA" \
-    --expect-authorization-sha "$AUTHORIZATION_SHA256" >/dev/null 2>&1
+    --expect-authorization-sha "$AUTHORIZATION_SHA256" \
+    --expect-oss-trust-profile-sha256 "$OSS_TRUST_PROFILE_SHA256" >/dev/null 2>&1
 }
 
 m8_already_committed_check() {
@@ -532,6 +553,7 @@ m8_build_claim() {
   m8_kv_set run_prefix "$RUN_PREFIX" "$kv"
   m8_kv_set claim_object "$CLAIM_OBJECT" "$kv"
   m8_kv_set issued_object "$ISSUED_OBJECT" "$kv"
+  m8_kv_set oss_trust_profile_sha256 "$OSS_TRUST_PROFILE_SHA256" "$kv"
   m8_kv_set single_use true "$kv"
   m8_kv_set instance_id "$EXPECTED_INSTANCE_ID" "$kv"
   m8_kv_set region_id "$EXPECTED_REGION_ID" "$kv"
@@ -572,6 +594,7 @@ document = {
     "run_prefix": values["run_prefix"],
     "claim_object": values["claim_object"],
     "issued_object": values["issued_object"],
+    "oss_trust_profile_sha256": values["oss_trust_profile_sha256"],
     "single_use": values["single_use"] == "true",
     "provider_identity": {
         "instance_id": values["instance_id"],
@@ -624,6 +647,58 @@ m8_provider_identity_preclaim() {
 }
 
 # ---------------------------------------------------------------------------
+# R2I-C4 / B03: OSS trust-target establishment.
+# ---------------------------------------------------------------------------
+
+# Step 11: observe the attached ECS instance RAM role NAME read-only. Only the
+# role-name LIST endpoint is queried; the per-role endpoint returns temporary
+# credentials and is never requested. The observed name is a non-secret live
+# value that the Human-issued trust profile later binds.
+m8_oss_observe_ecs_role_name() {
+  local role
+  role=$(m8_provider_identity_observe_ecs_role_name) || {
+    m8_die 'read-only ECS RAM role-name observation failed; refusing any OSS access'
+    return 1
+  }
+  [[ -n "$role" ]] || { m8_die 'observed ECS RAM role name is empty'; return 1; }
+  ECS_ROLE_NAME="$role"
+  export M8_OSS_ECS_ROLE_NAME="$role"
+  export ECS_ROLE_NAME
+  # The read-only observation NEVER creates host state. The wrapper has already
+  # created the pre-claim staging directory before step 8; if it is absent (for
+  # example in an offline fixture that drives the phase functions directly) the
+  # provenance record is simply skipped. Manufacturing the directory here would
+  # defeat the "pre-claim staging already exists" retry guard.
+  if [[ -n "${M8_PRECLAIM_DIR:-}" && -d "$M8_PRECLAIM_DIR" ]]; then
+    {
+      printf 'ecs_role_name_observed=%s\n' "$role"
+      printf 'ecs_role_name_observation_utc=%s\n' "$(date -u +%FT%TZ)"
+      printf 'ecs_role_name_endpoint=meta-data/ram/security-credentials/\n'
+      printf 'note=role-name list endpoint only; no credential payload was requested or read\n'
+    } >> "$M8_PRECLAIM_DIR/oss-preclaim.log" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# Step 12: build the exact 18-field trust profile from the frozen constants plus
+# the observed live values, and record its digest. The digest is derived here and
+# is never a caller-supplied environment variable.
+m8_prepare_oss_trust_profile() {
+  m8_oss_trust_profile_assert_canonical || return 1
+  OSS_TRUST_PROFILE_SHA256="$(m8_oss_trust_profile_sha256)" || return 1
+  [[ "$OSS_TRUST_PROFILE_SHA256" =~ ^[0-9a-f]{64}$ ]] ||
+    { m8_die 'derived OSS trust profile digest is not a SHA-256'; return 1; }
+  OSSUTIL_ABSOLUTE_PATH="${M8_OSSUTIL_ABSOLUTE_PATH:-}"
+  OSSUTIL_VERSION="${M8_OSSUTIL_VERSION:-}"
+  OSSUTIL_BINARY_SHA256="${M8_OSSUTIL_BINARY_SHA256:-}"
+  export OSS_TRUST_PROFILE_SHA256 OSSUTIL_ABSOLUTE_PATH OSSUTIL_VERSION OSSUTIL_BINARY_SHA256
+  if [[ -n "${M8_PRECLAIM_DIR:-}" ]]; then
+    m8_oss_trust_profile_values > "$M8_PRECLAIM_DIR/oss-trust-profile.txt" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # Evidence initialisation after a successful claim.
 # ---------------------------------------------------------------------------
 m8_write_invocation_context() {
@@ -672,6 +747,17 @@ m8_write_wrapper_provenance() {
     printf 'imds_base_url=%s\n' "$(m8_imds_base_url)"
     printf 'synthetic_test_mode=%s\n' "${M8_SYNTHETIC_TEST_MODE:-0}"
     printf 'started_utc=%s\n' "$(date -u +%FT%TZ)"
+    # --- R2I-C4/B03: field-level durable record of the effective OSS trust
+    # target. Together with the frozen constants this is sufficient to
+    # reconstruct the exact 18 serialized trust-profile bytes. No credential,
+    # token or temporary-credential material is ever recorded here.
+    printf 'oss_trust_profile_sha256=%s\n' "${OSS_TRUST_PROFILE_SHA256:-}"
+    printf 'ossutil_absolute_path=%s\n' "${OSSUTIL_ABSOLUTE_PATH:-}"
+    printf 'bucket_location_observed=%s\n' "${M8_OSS_BUCKET_LOCATION_OBSERVED:-}"
+    printf 'environment_guard=%s\n' "${ENVIRONMENT_GUARD_STATE:-NOT_RUN}"
+    printf 'oss_trust_profile_field_count=18\n'
+    printf 'oss_trust_profile_serialization=UTF-8 key=value LF records, field_01..field_18, exactly one final LF\n'
+    m8_oss_trust_profile_values
   } >"$target/wrapper-provenance.txt"
 }
 
@@ -860,6 +946,7 @@ m8_build_package_index() {
   m8_kv_set authorization_sha256 "$AUTHORIZATION_SHA256" "$kv"
   m8_kv_set semantic_auth_sha256 "$SEMANTIC_AUTH_SHA256" "$kv"
   m8_kv_set retry_auth_sha256 "$RETRY_AUTH_SHA256" "$kv"
+  m8_kv_set oss_trust_profile_sha256 "$OSS_TRUST_PROFILE_SHA256" "$kv"
   m8_kv_set proof_sha "$APPROVED_PROOF_SHA" "$kv"
   m8_kv_set proof_tree "$(git -C "$M8_PROOF_ROOT" rev-parse HEAD^{tree})" "$kv"
   m8_kv_set candidate_sha "$M8_APP_SHA" "$kv"
@@ -913,6 +1000,7 @@ document = {
     "authorization_sha256": values["authorization_sha256"],
     "semantic_auth_sha256": values["semantic_auth_sha256"],
     "retry_auth_sha256": None if values["retry_auth_sha256"] == "null" else values["retry_auth_sha256"],
+    "oss_trust_profile_sha256": values["oss_trust_profile_sha256"],
     "proof_sha": values["proof_sha"],
     "proof_tree": values["proof_tree"],
     "candidate_sha": values["candidate_sha"],
@@ -1022,6 +1110,10 @@ m8_phase_b_seal_retry() {
 
   index_manifest_sha="$(m8_json_get "$M8_PACKAGE_INDEX_LOCAL" artifact_manifest.sha256)"
   index_size="$(m8_json_get "$M8_PACKAGE_INDEX_LOCAL" archive.size_bytes)"
+  # R2I-C4/B03: a durability retry must target the same OSS trust profile that
+  # the pre-existing sealed package index was written under.
+  m8_expect "$(m8_json_get "$M8_PACKAGE_INDEX_LOCAL" oss_trust_profile_sha256)" \
+    "$OSS_TRUST_PROFILE_SHA256" retry_package_index_oss_trust_profile || return 1
   EXECUTION_STARTED_UTC="$(m8_json_get "$M8_PACKAGE_INDEX_LOCAL" execution_started_utc)"
   SEALED_CORE_RC="$(m8_json_get "$M8_PACKAGE_INDEX_LOCAL" exit_codes.core)"
   SEALED_ADAPTER_RC="$(m8_json_get "$M8_PACKAGE_INDEX_LOCAL" exit_codes.adapter)"
@@ -1122,7 +1214,7 @@ m8_verify_durable_archive() {
 }
 
 m8_phase_c_durability() {
-  local fetched_index='' fetched_index_sha='' index_archive_sha='' index_manifest_sha=''
+  local fetched_index='' fetched_index_sha='' index_archive_sha='' index_manifest_sha='' index_profile_sha=''
 
   m8_oss_versioning_guard "$M8_SEAL_DIR" || {
     m8_die 'bucket versioning is not eligible immediately before durability writes (FAIL CLOSED)'
@@ -1165,9 +1257,13 @@ m8_phase_c_durability() {
   fi
   index_archive_sha="$(m8_json_get "$fetched_index" archive.sha256)"
   index_manifest_sha="$(m8_json_get "$fetched_index" artifact_manifest.sha256)"
+  index_profile_sha="$(m8_json_get "$fetched_index" oss_trust_profile_sha256)"
   rm -f "$fetched_index"
   m8_expect "$index_archive_sha" "$SEALED_ARCHIVE_SHA256" package_index_archive_binding || return 1
   m8_expect "$index_manifest_sha" "$SEALED_MANIFEST_SHA256" package_index_manifest_binding || return 1
+  # R2I-C4/B03: the durable package index must carry the exact current profile.
+  m8_expect "$index_profile_sha" "$OSS_TRUST_PROFILE_SHA256" \
+    package_index_oss_trust_profile_binding || return 1
   return 0
 }
 
@@ -1187,6 +1283,7 @@ m8_build_receipt() {
   m8_kv_set claim_object "$CLAIM_OBJECT" "$kv"
   m8_kv_set issued_object "$ISSUED_OBJECT" "$kv"
   m8_kv_set issued_document_sha256 "$ISSUED_DOCUMENT_SHA256" "$kv"
+  m8_kv_set oss_trust_profile_sha256 "$OSS_TRUST_PROFILE_SHA256" "$kv"
   m8_kv_set proof_sha "$APPROVED_PROOF_SHA" "$kv"
   m8_kv_set proof_tree "$(git -C "$M8_PROOF_ROOT" rev-parse HEAD^{tree})" "$kv"
   m8_kv_set candidate_sha "$M8_APP_SHA" "$kv"
@@ -1239,6 +1336,7 @@ document = {
     "authorization_sha256": values["authorization_sha256"],
     "semantic_auth_sha256": values["semantic_auth_sha256"],
     "retry_auth_sha256": None if values["retry_auth_sha256"] == "null" else values["retry_auth_sha256"],
+    "oss_trust_profile_sha256": values["oss_trust_profile_sha256"],
     "claim_sha256": values["claim_sha256"],
     "claim_object": values["claim_object"],
     "issued_object": values["issued_object"],
@@ -1280,6 +1378,7 @@ document = {
         "package_index_archive_sha256": values["archive_sha256"],
         "manifest_sha256": values["artifact_manifest_sha256"],
         "issued_document_sha256": values["issued_document_sha256"],
+        "oss_trust_profile_sha256": values["oss_trust_profile_sha256"],
         "claim_object_sha256": values["claim_sha256"],
     },
 }
@@ -1336,6 +1435,7 @@ m8_phase_d_commit() {
     --expect-candidate-sha "$M8_APP_SHA" \
     --expect-authorization-sha "$AUTHORIZATION_SHA256" \
     --expect-archive-sha256 "$SEALED_ARCHIVE_SHA256" \
+    --expect-oss-trust-profile-sha256 "$OSS_TRUST_PROFILE_SHA256" \
     --json-out "$M8_SEAL_DIR/closure-receipt-check.json" || {
     m8_die 'read-back closure receipt failed validation (FAIL CLOSED, no formal RC)'
     return 1
@@ -1389,6 +1489,11 @@ m8_wrapper_run() {
   # external I/O or host-state mutation. Offline tests exercise the phase
   # functions directly and never reach this guard.
   m8_reject_synthetic_overrides || return 1
+  # R2I-C4/B03: the OSS trust-target environment is closed. This runs immediately
+  # after the seam guard and before wrapper init, authorization processing,
+  # provider access, OSS access, host-state or evidence creation.
+  m8_reject_oss_trust_environment || return 1
+  ENVIRONMENT_GUARD_STATE='PASS'
   m8_wrapper_init || return 1
   m8_guard_environment || return 1
   m8_guard_local_syntax || return 1
@@ -1401,13 +1506,22 @@ m8_wrapper_run() {
     { m8_die "pre-claim staging already exists: $M8_PRECLAIM_DIR"; return 1; }
   mkdir -p "$M8_PRECLAIM_DIR" || return 1
 
-  m8_oss_capability_guard "$M8_PRECLAIM_DIR" || return 1
-  m8_oss_versioning_guard "$M8_PRECLAIM_DIR" || return 1
-  m8_load_authorization || return 1
-  m8_already_committed_check || return 1
-  m8_provider_identity_preclaim || return 1
-  m8_claim_create || return 1
-  m8_evidence_initialize || return 1
+  # --- OSS trust-target establishment (all read-only, all before any write) ---
+  # Ordering invariant: no PutObject may occur anywhere below until every step
+  # 8-19 has succeeded. Steps 14/15 are read-only; the first permitted mutating
+  # call is the atomic claim at step 20.
+  m8_oss_canonical_config_guard "$M8_PRECLAIM_DIR" || return 1   # 8
+  m8_ossutil_identity_guard "$M8_PRECLAIM_DIR" || return 1       # 9
+  m8_provider_identity_preclaim || return 1                      # 10
+  m8_oss_observe_ecs_role_name || return 1                       # 11
+  m8_prepare_oss_trust_profile || return 1                       # 12
+  m8_oss_capability_guard "$M8_PRECLAIM_DIR" || return 1         # 13
+  m8_oss_bucket_location_guard "$M8_PRECLAIM_DIR" || return 1    # 14
+  m8_oss_versioning_guard "$M8_PRECLAIM_DIR" || return 1         # 15
+  m8_load_authorization || return 1                             # 16-18
+  m8_already_committed_check || return 1                        # 19
+  m8_claim_create || return 1                                   # 20
+  m8_evidence_initialize || return 1                            # 21
 
   case "$AUTHORIZATION_KIND" in
     SEMANTIC) m8_phase_a_execute || return 1 ;;

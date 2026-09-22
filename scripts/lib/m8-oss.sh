@@ -2,27 +2,38 @@
 # shellcheck shell=bash
 # LinguaGraph M8 durable-evidence OSS client.
 #
-# Contract (R2B):
+# Contract (R2B + R2I-C4/B03):
 #   * official `ossutil api <operation>` commands ONLY;
 #   * no custom OSS request signing, no Alibaba OSS SDK dependency;
 #   * the proof harness NEVER installs ossutil (host provisioning supplies it);
+#   * every network-capable invocation carries the CLI-pinned trust target:
+#     --config-file <proof-tree inert config>  --region cn-hongkong
+#     --endpoint https://oss-cn-hongkong-internal.aliyuncs.com
+#     --mode EcsRamRole  --ecs-role-name <observed live role>
+#     --addressing-style virtual  --ignore-env-var
+#     never --skip-verify-cert, never AK/STS/RamRoleArn credential flags;
+#   * ambient config selection is impossible: M8_OSSUTIL_CONFIG_FILE is rejected
+#     by the closed trust-environment guard and is never consumed here, and the
+#     default ~/.ossutilconfig is never relied upon;
 #   * every canonical object is created with atomic create-if-absent
 #     (put-object ... --forbid-overwrite true), never HEAD-then-unconditional-PUT;
 #   * every PutObject body uses the official file form `--body file://<path>`;
 #     a bare local path is never passed as a body;
 #   * GetObject stays byte-exact: the response body goes straight from ossutil
 #     stdout into a file, never through shell command substitution or a variable;
-#   * bucket versioning is verified read-only and must be unversioned before any
-#     PutObject; the harness has no PutBucketVersioning authority;
+#   * bucket location must be cn-hongkong and bucket versioning must be
+#     unversioned before any PutObject; the harness has no PutBucketVersioning
+#     authority;
 #   * existing objects are never overwritten and ETag is never treated as SHA-256.
 #
 # Configuration:
 #   M8_OSS_BUCKET                required canonical bucket name
-#   M8_OSSUTIL_BIN               executable (default: ossutil); synthetic tests
-#                                point this at a stub binary
-#   M8_OSSUTIL_CONFIG_FILE       optional ossutil config file (-c)
-#   M8_OSSUTIL_GET_OUTPUT_FLAG   optional response-body flag for get-object
-#                                (default: capture stdout, byte-exact)
+#   M8_OSSUTIL_BIN               offline synthetic stub ONLY (rejected in
+#                                production by the C1 seam guard)
+#   M8_OSS_ECS_ROLE_NAME         runtime observed ECS RAM role name (never a
+#                                caller-selected override in production)
+#   M8_OSSUTIL_GET_OUTPUT_FLAG   synthetic response-body flag for get-object
+#                                (rejected in production by the C1 seam guard)
 #
 # Return codes:
 #   M8_OSS_OK=0  M8_OSS_EXISTS=10  M8_OSS_ERROR=11  M8_OSS_ABSENT=12
@@ -32,12 +43,32 @@ readonly M8_OSS_EXISTS=10
 readonly M8_OSS_ERROR=11
 readonly M8_OSS_ABSENT=12
 
+# --- R2I-C4 frozen trust constants (from the Human contract) -----------------
+readonly M8_OSS_TRUST_PROFILE_SCHEMA='linguagraph-m8-oss-trust-profile/v1'
+readonly M8_OSS_REGION='cn-hongkong'
+readonly M8_OSS_ENDPOINT='https://oss-cn-hongkong-internal.aliyuncs.com'
+readonly M8_OSS_ENDPOINT_CLASS='INTERNAL'
+readonly M8_OSS_NETWORK_POLICY='SAME_REGION_INTERNAL_ONLY'
+readonly M8_OSS_ADDRESSING_STYLE='virtual'
+readonly M8_OSS_AUTH_MODE='EcsRamRole'
+readonly M8_OSS_TLS_VERIFICATION='required'
+readonly M8_OSS_CONFIG_RELPATH='scripts/config/m8-ossutil-formal.ini'
+readonly M8_OSS_CONFIG_PROFILE='default'
+readonly M8_OSS_CONFIG_POLICY_ID='m8-proof-tree-inert-config/v1'
+readonly M8_OSS_ENV_POLICY_ID='m8-oss-env-closed/v1'
+readonly M8_OSS_IGNORE_ENV_VARS='true'
+readonly M8_OSS_CONFIG_SHA256='76e66fda3cb1279873039930dcf15834f56067434423781dbdd94d84de5a011e'
+readonly M8_OSS_CONFIG_BYTES='22'
+readonly M8_OSS_MIN_VERSION='2.2.0'
+readonly M8_OSS_BUCKET_LOCATION='oss-cn-hongkong'
+
 m8_python_bin() { printf '%s' "${M8_PYTHON_BIN:-python3}"; }
 
 m8_oss_die() { printf 'FAIL: %s\n' "$*" >&2; return 1; }
 
 m8_oss_bucket() { printf '%s' "${M8_OSS_BUCKET:-}"; }
 m8_ossutil_bin() { printf '%s' "${M8_OSSUTIL_BIN:-ossutil}"; }
+m8_oss_ecs_role_name() { printf '%s' "${M8_OSS_ECS_ROLE_NAME:-}"; }
 
 # Validate bucket/executable configuration. Fails closed on anything unset,
 # malformed or non-executable.
@@ -58,27 +89,144 @@ m8_oss_require_config() {
   return 0
 }
 
-# Run one official ossutil api operation. No shell evaluation of arguments.
-m8_oss_api() {
-  local bin config
+# --- canonical proof-tree inert configuration identity ----------------------
+m8_oss_proof_root() {
+  local root=${M8_PROOF_ROOT:-}
+  [[ -n "$root" ]] || { m8_oss_die 'M8_PROOF_ROOT is not set; cannot resolve the canonical OSS config'; return 1; }
+  printf '%s' "$root"
+}
+
+m8_oss_canonical_config_path() {
+  local root
+  root=$(m8_oss_proof_root) || return 1
+  printf '%s/%s' "$root" "$M8_OSS_CONFIG_RELPATH"
+}
+
+# Fail closed unless the canonical proof-tree config is an exact, regular,
+# in-worktree file with the reviewed byte identity. There is no fallback to
+# ~/.ossutilconfig, OSSUTIL_CONFIG_FILE or any caller-selected profile.
+m8_oss_canonical_config_guard() {
+  local root config size sha
+  root=$(m8_oss_proof_root) || return 1
+  config="$root/$M8_OSS_CONFIG_RELPATH"
+
+  [[ -e "$config" ]] || { m8_oss_die "canonical OSS config is absent: $M8_OSS_CONFIG_RELPATH"; return 1; }
+  [[ -f "$config" && ! -L "$config" ]] ||
+    { m8_oss_die "canonical OSS config must be a regular non-symlink file: $M8_OSS_CONFIG_RELPATH"; return 1; }
+
+  case "$config" in
+    "$root"/*) ;;
+    *) m8_oss_die 'canonical OSS config escapes the proof worktree'; return 1 ;;
+  esac
+
+  size=$(wc -c <"$config" | tr -d '[:space:]')
+  [[ "$size" == "$M8_OSS_CONFIG_BYTES" ]] ||
+    { m8_oss_die "canonical OSS config size is $size (expected $M8_OSS_CONFIG_BYTES)"; return 1; }
+  sha=$(sha256sum "$config" | cut -d' ' -f1)
+  [[ "$sha" == "$M8_OSS_CONFIG_SHA256" ]] ||
+    { m8_oss_die "canonical OSS config SHA-256 mismatch (expected $M8_OSS_CONFIG_SHA256; got $sha)"; return 1; }
+
+  # The config is inert: it must declare nothing but the language key.
+  local body
+  body=$(grep -vE '^[[:space:]]*(#|$)' "$config" | sort | tr '\n' ' ')
+  [[ "$body" == "[default] language=EN " ]] ||
+    { m8_oss_die 'canonical OSS config contains unexpected keys'; return 1; }
+  return 0
+}
+
+# --- ossutil executable identity --------------------------------------------
+# Resolve the runtime ossutil, require an executable regular file, canonicalise
+# symlinks to an absolute path, and record path/version/SHA-256. The version must
+# parse as major.minor.patch and be >= 2.2.0 (required for --ignore-env-var).
+# No live path/version/hash is hard-coded anywhere.
+m8_ossutil_identity_guard() {
+  local bin resolved version_line version
   bin=$(m8_ossutil_bin)
-  config="${M8_OSSUTIL_CONFIG_FILE:-}"
-  if [[ -n "$config" ]]; then
-    "$bin" --config-file "$config" api "$@"
+  m8_oss_require_config || return 1
+
+  if [[ "$bin" == */* ]]; then
+    resolved="$bin"
   else
-    "$bin" api "$@"
+    resolved=$(command -v "$bin" 2>/dev/null || printf '')
+    [[ -n "$resolved" ]] || { m8_oss_die "ossutil executable is absent from PATH: $bin"; return 1; }
   fi
+  [[ -f "$resolved" ]] || { m8_oss_die "ossutil is not a regular file: $resolved"; return 1; }
+  [[ -x "$resolved" ]] || { m8_oss_die "ossutil is not executable: $resolved"; return 1; }
+  resolved=$(readlink -f "$resolved" 2>/dev/null || printf '%s' "$resolved")
+  [[ "$resolved" == /* ]] || { m8_oss_die "ossutil path did not resolve to an absolute path: $resolved"; return 1; }
+  [[ -f "$resolved" && -x "$resolved" ]] ||
+    { m8_oss_die "resolved ossutil target is not an executable regular file: $resolved"; return 1; }
+
+  version_line=$("$resolved" version 2>&1) || { m8_oss_die "ossutil version command failed"; return 1; }
+  # The classifier program is supplied on stdin, so the version text is passed
+  # as a file argument rather than piped (a pipe would be consumed by the
+  # interpreter reading the program itself).
+  local version_file
+  version_file=$(mktemp "${TMPDIR:-/tmp}/m8-ossutil-version.XXXXXX")
+  printf '%s\n' "$version_line" > "$version_file"
+  version=$("$(m8_python_bin)" - "$version_file" "$M8_OSS_MIN_VERSION" <<'PY'
+import re
+import sys
+
+with open(sys.argv[1], encoding="utf-8", errors="replace") as handle:
+    text = handle.read()
+minimum = sys.argv[2]
+match = re.search(r"(\d+)\.(\d+)\.(\d+)", text)
+if not match:
+    sys.stderr.write("FAIL: ossutil version output does not contain a major.minor.patch version: %r\n" % text[:200])
+    raise SystemExit(1)
+found = tuple(int(part) for part in match.groups())
+want = tuple(int(part) for part in minimum.split("."))
+if found < want:
+    sys.stderr.write("FAIL: ossutil version %d.%d.%d is below the required minimum %s\n" % (found + (minimum,)))
+    raise SystemExit(1)
+sys.stdout.write("%d.%d.%d\n" % found)
+PY
+  ) || { rm -f "$version_file"; return 1; }
+  rm -f "$version_file"
+
+  M8_OSSUTIL_ABSOLUTE_PATH="$resolved"
+  M8_OSSUTIL_VERSION="$version"
+  M8_OSSUTIL_BINARY_SHA256="$(sha256sum "$resolved" | cut -d' ' -f1)"
+  export M8_OSSUTIL_ABSOLUTE_PATH M8_OSSUTIL_VERSION M8_OSSUTIL_BINARY_SHA256
+  return 0
+}
+
+# --- CLI-pinned trust target -------------------------------------------------
+# Every network-capable invocation receives the canonical global arguments.
+# Fails closed if the observed role name is not yet established.
+m8_oss_global_args() {
+  local role config
+  role=$(m8_oss_ecs_role_name)
+  [[ -n "$role" ]] ||
+    { m8_oss_die 'observed ECS RAM role name is not established; refusing any OSS call'; return 1; }
+  config=$(m8_oss_canonical_config_path) || return 1
+  M8_OSS_GLOBAL_ARGS=(
+    --config-file "$config"
+    --region "$M8_OSS_REGION"
+    --endpoint "$M8_OSS_ENDPOINT"
+    --mode "$M8_OSS_AUTH_MODE"
+    --ecs-role-name "$role"
+    --addressing-style "$M8_OSS_ADDRESSING_STYLE"
+    --ignore-env-var
+  )
+  return 0
+}
+
+# Run one official ossutil api operation through the canonical trust target.
+# No shell evaluation of arguments.
+m8_oss_api() {
+  local bin
+  bin=$(m8_ossutil_bin)
+  m8_oss_global_args || return 1
+  "$bin" "${M8_OSS_GLOBAL_ARGS[@]}" api "$@"
 }
 
 m8_oss_run() {
-  local bin config
+  local bin
   bin=$(m8_ossutil_bin)
-  config="${M8_OSSUTIL_CONFIG_FILE:-}"
-  if [[ -n "$config" ]]; then
-    "$bin" --config-file "$config" "$@"
-  else
-    "$bin" "$@"
-  fi
+  m8_oss_global_args || return 1
+  "$bin" "${M8_OSS_GLOBAL_ARGS[@]}" "$@"
 }
 
 # ---------------------------------------------------------------------------
@@ -90,7 +238,8 @@ m8_oss_run() {
 # ---------------------------------------------------------------------------
 m8_oss_capability_guard() {
   local evidence=${1:-'-'} op probe_output='' aggregate='' probe_ok=0
-  local -a operations=(put-object get-object head-object get-bucket-versioning)
+  local -a operations=(put-object get-object head-object get-bucket-versioning get-bucket-location)
+  local -a global_flags=(--config-file --region --endpoint --mode --ecs-role-name --addressing-style --ignore-env-var)
   local help_output='' help_ok=0 probes_ok=0
 
   m8_oss_require_config || return 1
@@ -152,9 +301,144 @@ m8_oss_capability_guard() {
   grep -Eiq 'forbid[-_]overwrite' <<<"$aggregate" ||
     { m8_oss_die "ossutil does not demonstrate the '--forbid-overwrite' put-object parameter"; return 1; }
 
+  # R2I-C4: the pinned global flags must be documented too, otherwise the
+  # canonical CLI trust target could not be established fail-closed.
+  local flag
+  for flag in "${global_flags[@]}"; do
+    grep -Eq -- "(^|[^a-z-])${flag}([^a-z-]|$)" <<<"$aggregate" ||
+      { m8_oss_die "ossutil help does not document the required global flag '$flag'"; return 1; }
+  done
+
   if [[ "$evidence" != '-' ]]; then
     printf 'ossutil_capability=PASS\n' >> "$evidence/ossutil-capability.txt"
   fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# R2I-C4 / B03: read-only bucket-location guard.
+#
+# The formal bucket MUST be in cn-hongkong. This runs through the canonical
+# CLI-pinned trust target and must succeed before any PutObject. Empty, unknown,
+# unparseable, AccessDenied, NoSuchBucket, wrong-region and any other API error
+# all FAIL CLOSED. No fallback to a public or cross-region endpoint exists.
+# ---------------------------------------------------------------------------
+m8_oss_bucket_location_guard() {
+  local evidence=${1:-'-'} raw='' rc=0 location='' raw_file=''
+  m8_oss_require_config || return 1
+
+  raw=$(m8_oss_api get-bucket-location --bucket "$(m8_oss_bucket)" 2>&1) || rc=$?
+
+  if [[ "$evidence" != '-' ]]; then
+    mkdir -p "$evidence" 2>/dev/null || true
+    {
+      printf 'get_bucket_location_rc=%s\n' "$rc"
+      printf 'get_bucket_location_output:\n%s\n' "$raw"
+    } >> "$evidence/oss-versioning-guard.txt"
+  fi
+
+  if (( rc != 0 )); then
+    m8_oss_die "bucket location query failed (rc=$rc); refusing any PutObject"
+    return 1
+  fi
+
+  raw_file=$(mktemp "${TMPDIR:-/tmp}/m8-location.XXXXXX")
+  printf '%s' "$raw" > "$raw_file"
+  location=$("$(m8_python_bin)" - "$raw_file" <<'PY'
+import re
+import sys
+
+with open(sys.argv[1], encoding="utf-8", errors="replace") as handle:
+    raw = handle.read()
+
+def fail(message):
+    sys.stderr.write("FAIL: %s\n" % message)
+    raise SystemExit(1)
+
+match = re.search(r"<LocationConstraint>\s*([^<]*?)\s*</LocationConstraint>", raw)
+if not match:
+    fail("bucket location response has no parseable LocationConstraint")
+value = match.group(1).strip()
+if not value:
+    fail("bucket location response has an empty LocationConstraint")
+sys.stdout.write(value + "\n")
+PY
+  ) || {
+    rm -f "$raw_file"
+    m8_oss_die 'bucket location response could not be classified; refusing any PutObject'
+    return 1
+  }
+  rm -f "$raw_file"
+
+  if [[ "$location" != "$M8_OSS_BUCKET_LOCATION" ]]; then
+    if [[ "$evidence" != '-' ]]; then
+      printf 'bucket_location=REJECTED:%s\n' "$location" >> "$evidence/oss-versioning-guard.txt"
+    fi
+    m8_oss_die "bucket is not formal-eligible: location '${location}' (required ${M8_OSS_BUCKET_LOCATION})"
+    return 1
+  fi
+
+  if [[ "$evidence" != '-' ]]; then
+    printf 'bucket_location=%s\n' "$location" >> "$evidence/oss-versioning-guard.txt"
+  fi
+  # The observed location is the live provenance value recorded in
+  # wrapper-provenance.txt; it is derived here and never hard-coded.
+  M8_OSS_BUCKET_LOCATION_OBSERVED="$location"
+  export M8_OSS_BUCKET_LOCATION_OBSERVED
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# R2I-C4 / B03: exact 18-field trust-profile serialization.
+#
+# Records are UTF-8 `key=value\n` in the exact frozen field order, with exactly
+# one LF after every record including the final one, and no CR/NUL. The digest is
+# SHA256 of those exact bytes; JSON canonicalization is never used, and the
+# digest is never a caller-supplied environment variable.
+# ---------------------------------------------------------------------------
+m8_oss_trust_profile_values() {
+  local bucket role version binary config_sha
+  bucket=$(m8_oss_bucket)
+  role=$(m8_oss_ecs_role_name)
+  version="${M8_OSSUTIL_VERSION:-}"
+  binary="${M8_OSSUTIL_BINARY_SHA256:-}"
+  config_sha="${M8_OSS_CONFIG_SHA256}"
+
+  [[ -n "$bucket" ]] || { m8_oss_die 'trust profile: bucket name is not established'; return 1; }
+  [[ -n "$role" ]] || { m8_oss_die 'trust profile: ECS role name is not established'; return 1; }
+  [[ -n "$version" ]] || { m8_oss_die 'trust profile: ossutil version is not established'; return 1; }
+  [[ -n "$binary" ]] || { m8_oss_die 'trust profile: ossutil binary SHA-256 is not established'; return 1; }
+
+  printf 'schema=%s\n' "$M8_OSS_TRUST_PROFILE_SCHEMA"
+  printf 'oss_bucket=%s\n' "$bucket"
+  printf 'oss_region=%s\n' "$M8_OSS_REGION"
+  printf 'effective_oss_endpoint=%s\n' "$M8_OSS_ENDPOINT"
+  printf 'endpoint_class=%s\n' "$M8_OSS_ENDPOINT_CLASS"
+  printf 'network_policy=%s\n' "$M8_OSS_NETWORK_POLICY"
+  printf 'addressing_style=%s\n' "$M8_OSS_ADDRESSING_STYLE"
+  printf 'oss_auth_mode=%s\n' "$M8_OSS_AUTH_MODE"
+  printf 'ecs_role_name=%s\n' "$role"
+  printf 'ossutil_version=%s\n' "$version"
+  printf 'ossutil_binary_sha256=%s\n' "$binary"
+  printf 'config_relpath=%s\n' "$M8_OSS_CONFIG_RELPATH"
+  printf 'config_sha256=%s\n' "$config_sha"
+  printf 'config_profile=%s\n' "$M8_OSS_CONFIG_PROFILE"
+  printf 'config_policy_id=%s\n' "$M8_OSS_CONFIG_POLICY_ID"
+  printf 'ignore_oss_env_vars=%s\n' "$M8_OSS_IGNORE_ENV_VARS"
+  printf 'env_policy_id=%s\n' "$M8_OSS_ENV_POLICY_ID"
+  printf 'tls_verification=%s\n' "$M8_OSS_TLS_VERIFICATION"
+}
+
+m8_oss_trust_profile_sha256() {
+  m8_oss_trust_profile_values | sha256sum | cut -d' ' -f1
+}
+
+m8_oss_trust_profile_assert_canonical() {
+  local bytes count
+  bytes=$(m8_oss_trust_profile_values | wc -c | tr -d '[:space:]')
+  count=$(m8_oss_trust_profile_values | grep -c '^[a-z0-9_]*=')
+  [[ "$count" == '18' ]] || { m8_oss_die "trust profile must contain exactly 18 records (got $count)"; return 1; }
+  [[ "$bytes" -gt 0 ]] || { m8_oss_die 'trust profile serialization is empty'; return 1; }
   return 0
 }
 

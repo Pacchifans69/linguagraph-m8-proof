@@ -62,9 +62,14 @@ single-use claim it refuses to consume any authorization, refuses to invoke the
 semantic core, and is reported as `NONFORMAL / NOT_APPLICABLE`.
 
 ```text
-pre-claim guards -> atomic claim -> PHASE A execution -> PHASE B seal
-                 -> PHASE C durability -> PHASE D commit -> terminal RC marker
+pre-claim guards -> OSS trust-target establishment (read-only) -> atomic claim
+                 -> PHASE A execution -> PHASE B seal -> PHASE C durability
+                 -> PHASE D commit -> terminal RC marker
 ```
+
+Every pre-claim guard, and every trust-target establishment step, is read-only.
+No `PutObject` may occur before all of them succeed; the first permitted mutating
+call of a formal run is the atomic claim.
 
 ### Frozen RC contract
 
@@ -114,6 +119,12 @@ the claim's, as defence in depth before invoking the core.
 Network addresses (VPC, vSwitch, private IPv4, EIP) are recorded as provenance
 but are not part of the immutable execution identity.
 
+The same library performs the read-only ECS RAM **role-name** observation used to
+pin the OSS auth mode, querying only the role-name LIST endpoint
+(`meta-data/ram/security-credentials/`) and never the credential-payload
+endpoint. The observed name is a live binding: it is never hard-coded here or in
+the harness, and it must be a single plain role name.
+
 ### OSS object model
 
 ```text
@@ -160,8 +171,98 @@ The manifest and archive digests are computed over those exact file bytes.
 
 The proof harness **never installs ossutil**; host provisioning supplies it. A
 capability guard must demonstrate support for
-`ossutil api put-object --forbid-overwrite true`, `get-object`, `head-object` and
-`get-bucket-versioning`; otherwise the wrapper fails closed.
+`ossutil api put-object --forbid-overwrite true`, `get-object`, `head-object`,
+`get-bucket-versioning` and `get-bucket-location`, **and** for the seven pinned
+global flags listed under *OSS trust target* below; otherwise the wrapper fails
+closed.
+
+### OSS trust target (CLI-pinned, EcsRamRole only)
+
+The trust model identifier is `CLI_PINNED_PROOF_TREE_CONFIG_ECS_RAM_ROLE`. Every
+network-capable `ossutil` invocation is issued through one canonical CLI trust
+target; ambient configuration is impossible by construction:
+
+```bash
+ossutil --config-file <proof-tree config> \
+  --region cn-hongkong \
+  --endpoint https://oss-cn-hongkong-internal.aliyuncs.com \
+  --mode EcsRamRole --ecs-role-name <observed live role> \
+  --addressing-style virtual --ignore-env-var \
+  api <operation> ...
+```
+
+- **Endpoint.** The frozen endpoint is the HTTPS **in-region internal** endpoint
+  (`endpoint_class=INTERNAL`, `network_policy=SAME_REGION_INTERNAL_ONLY`). No
+  public, cross-region or caller-selected endpoint is ever used.
+- **Authentication.** `EcsRamRole` only. The harness never carries an
+  AK/SK, STS token or explicit RAM role ARN: `--access-key-id`,
+  `--access-key-secret`, `--sts-token`, `--ram-role-arn` and
+  `--role-session-name` are structurally absent, and TLS verification is never
+  disabled (`--skip-verify-cert` is never used).
+- **Role name.** The role name is **observed read-only at runtime** from the
+  IMDS role-name LIST endpoint
+  (`meta-data/ram/security-credentials/`). Zero roles, multiple roles, control
+  characters, a CR or a path-like value all fail closed. The credential-payload
+  endpoint is never requested.
+- **Configuration.** `scripts/config/m8-ossutil-formal.ini` is a **proof-tree
+  inert config** (22 bytes, `[default]` + `language=EN` only) with a frozen
+  SHA-256. It must be a regular, non-symlinked, in-worktree file with exactly
+  that byte identity, and it must declare no other key. There is **no fallback**
+  to `~/.ossutilconfig` or to any caller-selected profile.
+- **Closed environment.** Nineteen ambient OSS/credential/proxy variable names
+  constitute a closed trust environment
+  (`m8-oss-env-closed/v1`). If any one is set — including
+  `M8_OSSUTIL_CONFIG_FILE`, every `OSS_*` credential and endpoint selector,
+  `OSSUTIL_CONFIG_FILE`, `OSSUTIL_PROFILE`, `ALIBABA_CLOUD_ECS_METADATA` and the
+  upper- and lower-case proxy families — the entrypoint **FAILS CLOSED** before
+  any provider access, authorization processing, host-state or evidence write,
+  naming the offending variable but never echoing its value. This is a separate
+  authority from the seven synthetic override seams; the two lists are never
+  merged. `--ignore-env-var` additionally makes the pinned CLI ignore
+  `OSS_`-prefixed variables.
+- **ossutil identity.** The resolved `ossutil` must be an executable regular
+  file; its absolute path, parsed `major.minor.patch` version and SHA-256 of the
+  resolved bytes are recorded at runtime. Versions below **2.2.0** (the floor
+  for `--ignore-env-var`) and unparseable banners fail closed.
+- **Bucket location.** A read-only `GetBucketLocation` must report the frozen
+  region; otherwise the run fails closed **before any `PutObject`**.
+
+#### OSS trust profile
+
+The observed bindings are serialized into an 18-record `key=value` profile
+(`linguagraph-m8-oss-trust-profile/v1`) in a frozen field order, UTF-8, one LF
+per record and exactly one final LF, with no CR, NUL or BOM. Its digest is
+`SHA256` of those exact bytes — never a caller-supplied value and never a JSON
+canonicalization. The digest is bound before the claim:
+
+1. the future Human-issued authorization must declare the same
+   `oss_trust_profile_sha256` (missing, malformed or different fails closed);
+2. the atomic `claim.json`, the sealed `package-index.json` and the
+   `closure-receipt.json` all carry it, the receipt both at top level and in
+   `cross_binding`;
+3. `verify-m8-closure-receipt.py` checks both carriers and accepts
+   `--expect-oss-trust-profile-sha256` for an independent Human expectation; and
+4. a durability retry must observe the same profile as the sealed semantic run,
+   and fails closed on any mismatch.
+
+No `PutObject` may occur before every trust-target step has succeeded; the first
+permitted mutating call of a formal run is the atomic claim.
+
+#### Live bindings this repository does NOT establish
+
+The following eight values are **live, unbound and unproven** here. They are
+resolved at runtime and are deliberately never hard-coded in this repository or
+in this document: the canonical OSS **bucket name**; the **ECS RAM role name**;
+the **observed role identity**; the **RAM policy result**; the **ossutil path**;
+the **ossutil version**; the **ossutil binary SHA-256**; and the **live
+capability result** (including bucket location and versioning).
+
+Nothing in this repository asserts that the bucket exists, that a role is
+attached to any instance, that any RAM policy has been proven, that `ossutil` is
+installed, or what its live path, version or binary hash is. No Gate 2 claim is
+made, no authorization has been issued for a formal run, and no formal run has
+been executed or completed. The profile digest shown by any local verification
+run is a synthetic fixture value, not a live binding.
 
 ### Critical OSS versioning guard
 
@@ -386,7 +487,7 @@ tests, and synthetic shell fixtures against a local stub ossutil. It never calls
 a provider API, Alibaba OSS, Playwright, pytest, Vitest or a Product build, and
 installs nothing.
 
-The harness exposes a closed set of offline synthetic seams, all owned by
+The harness exposes a closed set of seven offline synthetic seams, all owned by
 `scripts/lib/m8-synthetic-seams.sh`:
 
 ```text
@@ -395,6 +496,8 @@ M8_IMDS_BASE_URL             redirected metadata endpoint
 M8_IMDS_CURL_BIN             redirected metadata client executable
 M8_OSSUTIL_BIN               stub object-store client
 M8_OSSUTIL_GET_OUTPUT_FLAG   alternative get-object response-body flag
+M8_ADAPTER_SCRIPT_OVERRIDE   synthetic formal-execution adapter
+M8_PYTHON_BIN                alternative interpreter for verifier programs
 ```
 
 They exist only so the offline verification can drive the same code paths
@@ -405,6 +508,12 @@ all listed variables unset      -> eligible
 any listed variable non-empty   -> FAIL CLOSED (no claim, no evidence tree,
                                    no canonical object, no formal marker)
 ```
+
+This synthetic seam authority is **separate** from the nineteen-name closed OSS
+trust-environment authority described under *OSS trust target*. Both live in the
+same shared library as two distinct arrays and are never merged; the trust
+environment is additionally rejected in production, where the synthetic seams
+are not.
 
 Both production entrypoints call `m8_reject_synthetic_overrides()` before any
 external I/O or host-state mutation: the formal wrapper
@@ -420,6 +529,26 @@ evidence/host-state paths, and **never** prints
 `HSDR_F02_FORMAL_RUN_COMMAND_RC`; it prints `M8_SYNTHETIC_OUTCOME=OK` instead. It
 must never be used with real credentials, and it does not bypass the durable
 single-use claim.
+
+The suite reports its results as independent counters so that a green legacy
+baseline can never be mistaken for trust-target evidence:
+
+```text
+R2E_B01_LEGACY_V01_V40=40/40
+R2E_B01_CORRECTION_REGRESSIONS=9/9
+R2E_B01_STATIC_CHECKS=11/11
+R2E_B01_SYNTHETIC_CHECKS=29/29
+R2I_C1_REGRESSIONS=2/2
+R2I_C4_B03_REGRESSIONS=12/12
+```
+
+`T01..T12` are the R2I-C4/B03 trust-target regressions: the closed
+trust-environment set, CLI trust-target pinning, canonical config identity,
+ossutil identity and version floor, bucket-location guard, read-only role-name
+observation, trust-profile canonicalization and digest sensitivity,
+authorization/claim/package-index/receipt binding, receipt verification, retry
+trust-target identity, and pre-claim ordering. Each is separately load-bearing:
+removing its production mechanism in a scratch copy makes that check fail.
 
 ## Mutation boundary
 

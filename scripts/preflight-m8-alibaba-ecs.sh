@@ -76,13 +76,30 @@ token=$(m8_imds_obtain_token) || die 'unable to obtain Alibaba IMDS token'
 [[ -n "$token" ]] || die 'Alibaba IMDS token is empty'
 printf 'imds_token_mode=successful\n'
 
-instance_id=$(m8_imds_get "$token" meta-data/instance-id)
-region_id=$(m8_imds_get "$token" meta-data/region-id)
-zone_id=$(m8_imds_get "$token" meta-data/zone-id)
-if ! instance_type=$(m8_imds_get "$token" meta-data/instance/instance-type 2>/dev/null); then
-  instance_type=$(m8_imds_get "$token" meta-data/instance-type)
+# R2I-C7: the seven immutable provider inputs are read through the shared
+# byte-safe authority in m8-provider-identity.sh. No raw immutable response body
+# is captured with command substitution here; only validated scalars and
+# canonical digests leave the classifier.
+instance_id=$(m8_provider_identity_scalar_read "$token" meta-data/instance-id) ||
+  die 'instance-id read failed (byte-safe)'
+region_id=$(m8_provider_identity_scalar_read "$token" meta-data/region-id) ||
+  die 'region-id read failed (byte-safe)'
+zone_id=$(m8_provider_identity_scalar_read "$token" meta-data/zone-id) ||
+  die 'zone-id read failed (byte-safe)'
+
+# Instance type: the fallback endpoint is used ONLY for a failed primary REQUEST.
+# A malformed primary response fails closed and never falls back.
+instance_type=''
+itype_rc=0
+instance_type=$(m8_provider_identity_scalar_read "$token" meta-data/instance/instance-type) || itype_rc=$?
+if (( itype_rc == M8_PROVIDER_SCALAR_REQUEST_FAILED )); then
+  itype_rc=0
+  instance_type=$(m8_provider_identity_scalar_read "$token" meta-data/instance-type) || itype_rc=$?
 fi
-image_id=$(m8_imds_get "$token" meta-data/image-id)
+(( itype_rc == 0 )) || die 'instance-type read failed (byte-safe)'
+
+image_id=$(m8_provider_identity_scalar_read "$token" meta-data/image-id) ||
+  die 'image-id read failed (byte-safe)'
 
 printf 'instance_id=%s\n' "$instance_id"
 printf 'region_id=%s\n' "$region_id"
@@ -95,12 +112,10 @@ printf 'private_ipv4=%s\n' "$(optional_imds "$token" meta-data/private-ipv4)"
 printf 'public_ipv4=%s\n' "$(optional_imds "$token" meta-data/public-ipv4)"
 printf 'eipv4=%s\n' "$(optional_imds "$token" meta-data/eipv4)"
 
-identity_document=$(m8_imds_get "$token" dynamic/instance-identity/document) || die 'instance identity document unavailable'
-identity_pkcs7=$(m8_imds_get "$token" dynamic/instance-identity/pkcs7) || die 'instance identity PKCS7 unavailable'
-[[ -n "$identity_document" ]] || die 'instance identity document is empty'
-[[ -n "$identity_pkcs7" ]] || die 'instance identity PKCS7 is empty'
-document_sha=$(printf '%s\n' "$identity_document" | sha256sum | cut -d' ' -f1)
-pkcs7_sha=$(printf '%s\n' "$identity_pkcs7" | sha256sum | cut -d' ' -f1)
+document_sha=$(m8_provider_identity_digest_read "$token" dynamic/instance-identity/document -) ||
+  die 'instance identity document read failed (byte-safe)'
+pkcs7_sha=$(m8_provider_identity_digest_read "$token" dynamic/instance-identity/pkcs7 -) ||
+  die 'instance identity PKCS7 read failed (byte-safe)'
 printf 'identity_document_sha256=%s\n' "$document_sha"
 printf 'identity_pkcs7_sha256=%s\n' "$pkcs7_sha"
 

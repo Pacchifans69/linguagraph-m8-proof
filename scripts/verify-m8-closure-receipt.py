@@ -35,6 +35,7 @@ EXPECTED_FIELDS = [
     ("claim_object", "str"),
     ("issued_object", "str"),
     ("issued_document_sha256", "sha256"),
+    ("oss_trust_profile_sha256", "sha256"),
     ("proof_sha", "sha40"),
     ("proof_tree", "sha40"),
     ("candidate_sha", "sha40"),
@@ -69,6 +70,7 @@ EXPECTED_FIELDS = [
     ("cross_binding.package_index_archive_sha256", "sha256"),
     ("cross_binding.manifest_sha256", "sha256"),
     ("cross_binding.issued_document_sha256", "sha256"),
+    ("cross_binding.oss_trust_profile_sha256", "sha256"),
     ("cross_binding.claim_object_sha256", "sha256"),
 ]
 
@@ -100,6 +102,8 @@ def parse_args(argv):
     parser.add_argument("--expect-candidate-sha", default=None)
     parser.add_argument("--expect-authorization-sha", default=None)
     parser.add_argument("--expect-archive-sha256", default=None)
+    parser.add_argument("--expect-oss-trust-profile-sha256", default=None,
+                        help="expected OSS trust-profile digest bound by the authorization")
     parser.add_argument("--json-out", default=None,
                         help="optional machine-readable PASS summary")
     return parser.parse_args(argv)
@@ -336,6 +340,7 @@ def main(argv=None):
         ("cross_binding.package_index_archive_sha256", archive_sha),
         ("cross_binding.manifest_sha256", manifest_sha),
         ("cross_binding.issued_document_sha256", get("issued_document_sha256")),
+        ("cross_binding.oss_trust_profile_sha256", get("oss_trust_profile_sha256")),
         ("cross_binding.claim_object_sha256", claim_sha),
     )
     for path, expected in cross_checks:
@@ -358,6 +363,8 @@ def main(argv=None):
         ("--expect-authorization-sha", args.expect_authorization_sha,
          "authorization_sha256"),
         ("--expect-archive-sha256", args.expect_archive_sha256, "archive_sha256"),
+        ("--expect-oss-trust-profile-sha256", args.expect_oss_trust_profile_sha256,
+         "oss_trust_profile_sha256"),
     )
     for flag, expected, path in expectations:
         if expected is None or path not in values:

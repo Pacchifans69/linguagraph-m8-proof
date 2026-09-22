@@ -29,6 +29,12 @@ SYNTH_TOTAL=0
 SYNTH_PASS=0
 CORR_TOTAL=0
 CORR_PASS=0
+R2I_TOTAL=0
+R2I_PASS=0
+R2I_C4_TOTAL=0
+R2I_C4_PASS=0
+R2I_C7_TOTAL=0
+R2I_C7_PASS=0
 declare -a FAILED_CHECKS=()
 
 run_check() {
@@ -37,6 +43,9 @@ run_check() {
     static) STATIC_TOTAL=$((STATIC_TOTAL + 1)) ;;
     synth) SYNTH_TOTAL=$((SYNTH_TOTAL + 1)) ;;
     corr) CORR_TOTAL=$((CORR_TOTAL + 1)) ;;
+    r2i) R2I_TOTAL=$((R2I_TOTAL + 1)) ;;
+    r2i_c4) R2I_C4_TOTAL=$((R2I_C4_TOTAL + 1)) ;;
+    r2i_c7) R2I_C7_TOTAL=$((R2I_C7_TOTAL + 1)) ;;
   esac
   out="$("$fn" 2>&1)" || rc=$?
   if (( rc == 0 )) && ! grep -q '^ASSERT_FAIL:' <<<"$out"; then
@@ -45,6 +54,9 @@ run_check() {
       static) STATIC_PASS=$((STATIC_PASS + 1)) ;;
       synth) SYNTH_PASS=$((SYNTH_PASS + 1)) ;;
       corr) CORR_PASS=$((CORR_PASS + 1)) ;;
+      r2i) R2I_PASS=$((R2I_PASS + 1)) ;;
+      r2i_c4) R2I_C4_PASS=$((R2I_C4_PASS + 1)) ;;
+      r2i_c7) R2I_C7_PASS=$((R2I_C7_PASS + 1)) ;;
     esac
   else
     printf 'FAIL [%-6s] %s %s\n' "$kind" "$id" "$desc"
@@ -88,6 +100,31 @@ assert_exit_fail() {
 assert_exit_ok() {
   "$@" >/dev/null 2>&1 || assert_fail "assert_exit_ok: $* unexpectedly failed"
 }
+# Structural JSON edit used by the R2I-C4 negatives: drop or replace one field
+# (dotted path supported) and rewrite the document canonically. Uses -c so the
+# interpreter never competes with a pipe for stdin.
+json_edit() {
+  local in=$1 out=$2 mode=$3 field=${4:-} value=${5:-}
+  "$PYTHON" -c '
+import json
+import sys
+
+src, dst, mode, path, value = sys.argv[1:6]
+with open(src, encoding="utf-8") as handle:
+    document = json.load(handle)
+if mode == "drop":
+    head, _, leaf = path.rpartition(".")
+    (document[head] if head else document).pop(leaf, None)
+elif mode == "set":
+    head, _, leaf = path.rpartition(".")
+    (document[head] if head else document)[leaf] = value
+else:
+    raise SystemExit("json_edit: unknown mode %r" % mode)
+with open(dst, "w", encoding="utf-8") as handle:
+    json.dump(document, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+' "$in" "$out" "$mode" "$field" "$value"
+}
 
 readonly CORE="$REPO_ROOT/scripts/run-m8-proof-core.sh"
 readonly ADAPTER="$REPO_ROOT/scripts/run-m8-proof-alibaba-ecs.sh"
@@ -112,18 +149,149 @@ readonly -a PLAYWRIGHT_FROZEN_SPECS=(
   'e2e/workbench-information-architecture.spec.ts'
 )
 
-# The five offline synthetic seams owned by scripts/lib/m8-synthetic-seams.sh.
+# The seven production override seams owned by scripts/lib/m8-synthetic-seams.sh.
+# This is the test-side copy used to build `env -u` argument lists; the
+# independent exact-set oracle lives in I01 and hard-codes the same seven names.
 readonly -a SYNTHETIC_SEAM_VARS=(
   M8_SYNTHETIC_TEST_MODE
   M8_IMDS_BASE_URL
   M8_IMDS_CURL_BIN
   M8_OSSUTIL_BIN
   M8_OSSUTIL_GET_OUTPUT_FLAG
+  M8_ADAPTER_SCRIPT_OVERRIDE
+  M8_PYTHON_BIN
+)
+
+# The 19 Human-frozen R2I-C4/B03 trust-environment names. This is the test-side
+# copy used to build `env -u` argument lists; T01 holds the independent
+# hard-coded exact-set oracle for the production authority.
+readonly -a OSS_TRUST_ENV_VARS=(
+  M8_OSSUTIL_CONFIG_FILE
+  OSS_ACCESS_KEY_ID
+  OSS_ACCESS_KEY_SECRET
+  OSS_SESSION_TOKEN
+  OSS_ROLE_ARN
+  OSS_ROLE_SESSION_NAME
+  OSS_REGION
+  OSS_ENDPOINT
+  OSSUTIL_CONFIG_FILE
+  OSSUTIL_PROFILE
+  ALIBABA_CLOUD_ECS_METADATA
+  HTTP_PROXY
+  HTTPS_PROXY
+  ALL_PROXY
+  NO_PROXY
+  http_proxy
+  https_proxy
+  all_proxy
+  no_proxy
 )
 
 # ===========================================================================
 # Synthetic formal fixture.
 # ===========================================================================
+
+# Offline IMDS client used by the B03 role-name observation tests and by the
+# synthetic trust-target establishment. It answers ONLY the IMDSv2 token
+# endpoint and the role-name LIST endpoint; it never serves credential payloads,
+# so a production regression to meta-data/ram/security-credentials/<role> is
+# detectable.
+#   M8_FAKE_IMDS_ROLE_MODE = one (default) | zero | multiple | control
+write_fake_imds_client() {
+  local path="$TMPROOT/fake-imds-curl.sh"
+  cat >"$path" <<'FAKEIMDS'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+url=''
+for arg in "$@"; do
+  case "$arg" in
+    http://*|https://*) url="$arg" ;;
+  esac
+done
+if [[ -n "${M8_FAKE_IMDS_LOG:-}" ]]; then printf '%s\n' "$url" >>"$M8_FAKE_IMDS_LOG"; fi
+mode="${M8_FAKE_IMDS_ROLE_MODE:-one}"
+role="${M8_FAKE_IMDS_ROLE_NAME:-M8SyntheticObservedRole}"
+case "$url" in
+  */api/token)
+    printf 'SYNTHETIC-IMDS-TOKEN-NOT-A-SECRET\n'
+    exit 0
+    ;;
+  */meta-data/ram/security-credentials/)
+    case "$mode" in
+      one)      printf '%s\n' "$role" ;;
+      zero)     exit 0 ;;
+      multiple) printf '%s\n%s\n' "$role" 'M8SyntheticSecondRole' ;;
+      control)  printf '%s\r\n' "$role" ;;
+      # R2I-C6: a REAL NUL byte between two role fragments. This must be an
+      # actual 0x00 on stdout, not the two printable characters backslash-zero.
+      nul)      printf '%s\0%s\n' "$role" 'M8SyntheticNulSuffix' ;;
+      *)        exit 1 ;;
+    esac
+    exit 0
+    ;;
+  */meta-data/ram/security-credentials/*)
+    printf 'Error: synthetic IMDS refuses the credential-payload endpoint\n' >&2
+    exit 22
+    ;;
+  *)
+    printf 'Error: synthetic IMDS has no route for %s\n' "$url" >&2
+    exit 22
+    ;;
+esac
+FAKEIMDS
+  chmod +x "$path"
+  printf '%s' "$path"
+}
+
+# Establish the B03 OSS trust target through the real production guards.
+establish_oss_trust_target() {
+  m8_oss_canonical_config_guard - || return 1
+  m8_ossutil_identity_guard - || return 1
+  m8_oss_observe_ecs_role_name || return 1
+  m8_prepare_oss_trust_profile || return 1
+}
+
+# Write + stage the synthetic SEMANTIC issued.json. Must be called AFTER the OSS
+# trust target is established, because the authorization binds its digest.
+# $1 (optional) overrides the profile digest to exercise mismatch paths.
+stage_semantic_issued_json() {
+  local profile_sha=${1:-$OSS_TRUST_PROFILE_SHA256}
+  "$PYTHON" - "$ISSUED_LOCAL" "$APPROVED_PROOF_SHA" "$APPROVED_PROOF_TREE" "$AUTH" "$profile_sha" <<'PY'
+import json
+import sys
+
+out, proof_sha, proof_tree, authorization_sha256, profile_sha = sys.argv[1:6]
+document = {
+    "schema": "linguagraph-m8-run-authorization/v1",
+    "authorization_kind": "SEMANTIC",
+    "authorization_id": "M8-EXI-01-RUN-SYNTHETIC",
+    "authorization_sha256": authorization_sha256,
+    "oss_trust_profile_sha256": profile_sha,
+    "proof_sha": proof_sha,
+    "proof_tree": proof_tree,
+    "candidate_sha": "2441f9cf60b7cc9402c5b257be010b559b39b717",
+    "candidate_tree": "5d1b7c7cc104cd365b0ea629d9ead7677d17f2be",
+    "candidate_parent": "e4b1cc66f540ab74c0ef9bd014b0a0da3a2d9c1d",
+    "frozen_main": "cf26ea557bd746a518ff32b8b7e7a7542be7f7ae",
+    "provider_identity": {
+        "instance_id": "i-j6c9854oyawy89fcdxy2",
+        "region_id": "cn-hongkong",
+        "zone_id": "cn-hongkong-d",
+        "instance_type": "ecs.g9i.xlarge",
+        "image_id": "ubuntu_24_04_x64_20G_alibase_20260916.vhd",
+        "identity_document_sha256": "60f62ad9f4c10aab718bdc6dfdf0c57e1e4ced293908417009df8e4b7dbdaa1d",
+        "identity_pkcs7_sha256": "89185b286e03b344a5ca7e2f3a242baf4b454419dab0cd83ec3426981860d211",
+    },
+    "authorized_executor_id": "alibaba-ecs:i-j6c9854oyawy89fcdxy2",
+    "single_use": True,
+    "issued_utc": "2026-01-01T00:00:00Z",
+}
+with open(out, "w", encoding="utf-8") as handle:
+    handle.write(json.dumps(document, indent=2, sort_keys=True) + "\n")
+PY
+  stage_object "authorizations/$AUTH/issued.json" "$ISSUED_LOCAL"
+}
+
 bootstrap_formal_fixture() {
   # shellcheck source=lib/m8-provider-identity.sh
   source "$IDENTITY_LIB"
@@ -155,7 +323,13 @@ bootstrap_formal_fixture() {
   export M8_OSSUTIL_BIN="$FAKE_OSSUTIL"
   export M8_FAKE_OSS_ROOT="$FAKE_ROOT"
   export M8_FAKE_OSS_VERSIONING='unversioned'
+  export M8_FAKE_OSS_LOCATION='cn-hongkong'
   export M8_EXECUTOR_ID="$M8_PROVIDER_EXECUTOR_ID"
+  # Offline IMDS used only for the read-only role-name observation.
+  export M8_IMDS_CURL_BIN="$(write_fake_imds_client)"
+  export M8_IMDS_BASE_URL='http://imds.invalid/latest'
+  export M8_FAKE_IMDS_ROLE_MODE='one'
+  export M8_FAKE_IMDS_ROLE_NAME='M8SyntheticObservedRole'
 
   ISSUED_LOCAL="$SB/issued.json"
   # B1 authorization identity: the Human-issued input is the exact TOKEN string.
@@ -163,41 +337,7 @@ bootstrap_formal_fixture() {
   # never derived from the issued-document bytes.
   SEMANTIC_TOKEN='M8-EXI-01-RUN-SYNTHETIC-TOKEN'
   AUTH="$(printf '%s' "$SEMANTIC_TOKEN" | sha256sum | cut -d' ' -f1)"
-  "$PYTHON" - "$ISSUED_LOCAL" "$APPROVED_PROOF_SHA" "$APPROVED_PROOF_TREE" "$AUTH" <<'PY'
-import json
-import sys
-
-out, proof_sha, proof_tree, authorization_sha256 = sys.argv[1:5]
-document = {
-    "schema": "linguagraph-m8-run-authorization/v1",
-    "authorization_kind": "SEMANTIC",
-    "authorization_id": "M8-EXI-01-RUN-SYNTHETIC",
-    "authorization_sha256": authorization_sha256,
-    "proof_sha": proof_sha,
-    "proof_tree": proof_tree,
-    "candidate_sha": "2441f9cf60b7cc9402c5b257be010b559b39b717",
-    "candidate_tree": "5d1b7c7cc104cd365b0ea629d9ead7677d17f2be",
-    "candidate_parent": "e4b1cc66f540ab74c0ef9bd014b0a0da3a2d9c1d",
-    "frozen_main": "cf26ea557bd746a518ff32b8b7e7a7542be7f7ae",
-    "provider_identity": {
-        "instance_id": "i-j6c9854oyawy89fcdxy2",
-        "region_id": "cn-hongkong",
-        "zone_id": "cn-hongkong-d",
-        "instance_type": "ecs.g9i.xlarge",
-        "image_id": "ubuntu_24_04_x64_20G_alibase_20260916.vhd",
-        "identity_document_sha256": "60f62ad9f4c10aab718bdc6dfdf0c57e1e4ced293908417009df8e4b7dbdaa1d",
-        "identity_pkcs7_sha256": "89185b286e03b344a5ca7e2f3a242baf4b454419dab0cd83ec3426981860d211",
-    },
-    "authorized_executor_id": "alibaba-ecs:i-j6c9854oyawy89fcdxy2",
-    "single_use": True,
-    "issued_utc": "2026-01-01T00:00:00Z",
-}
-with open(out, "w", encoding="utf-8") as handle:
-    handle.write(json.dumps(document, indent=2, sort_keys=True) + "\n")
-PY
-
   export M8_PROOF_RUN_AUTHORIZATION="$SEMANTIC_TOKEN"
-  stage_object "authorizations/$AUTH/issued.json" "$ISSUED_LOCAL"
 
   M8_PRECLAIM_DIR="$HOST/preclaim/$AUTH"
   SEAL_DIR="$HOST/sealed/$AUTH"
@@ -271,6 +411,13 @@ run_formal_success() {
   source "$REPO_ROOT/scripts/run-m8-proof.sh"
   m8_wrapper_init
   m8_guard_local_syntax || return 1
+  # R2I-C4/B03: establish the OSS trust target, then bind it in the synthetic
+  # authorization exactly as the production pre-claim order does.
+  establish_oss_trust_target || return 1
+  stage_semantic_issued_json || return 1
+  m8_oss_capability_guard "$M8_PRECLAIM_DIR" || return 1
+  m8_oss_bucket_location_guard "$M8_PRECLAIM_DIR" || return 1
+  m8_oss_versioning_guard "$M8_PRECLAIM_DIR" || return 1
   m8_load_authorization || return 1
   m8_claim_create || return 1
   m8_evidence_initialize || return 1
@@ -450,6 +597,8 @@ v10() {
     source "$WRAPPER"
     m8_wrapper_init
     m8_guard_local_syntax || return 1
+    establish_oss_trust_target || return 1
+    stage_semantic_issued_json || return 1
     m8_load_authorization || return 1
     m8_claim_create || return 1
     m8_evidence_initialize || return 1
@@ -474,6 +623,8 @@ v11() {
     export M8_FAKE_OSS_FAIL_PUT_KEY="$M8_OSS_BUCKET-placeholder"
     m8_wrapper_init
     m8_guard_local_syntax || return 1
+    establish_oss_trust_target || return 1
+    stage_semantic_issued_json || return 1
     m8_load_authorization || return 1
     m8_claim_create || return 1
     m8_evidence_initialize || return 1
@@ -499,6 +650,8 @@ v12() {
     source "$WRAPPER"
     m8_wrapper_init
     m8_guard_local_syntax || return 1
+    establish_oss_trust_target || return 1
+    stage_semantic_issued_json || return 1
     m8_load_authorization || return 1
     m8_claim_create || return 1
     m8_evidence_initialize || return 1
@@ -594,6 +747,8 @@ v16() {
     source "$WRAPPER"
     m8_wrapper_init
     m8_guard_local_syntax || return 1
+    establish_oss_trust_target || return 1
+    stage_semantic_issued_json || return 1
     m8_load_authorization || return 1
     m8_claim_create || return 1
     local claimed_sha
@@ -638,16 +793,39 @@ v17() {
 }
 
 v18() {
-  local body version_line identity_line claim_line
+  local body anchor missing=0 previous=0 current=0
   body="$TMPROOT/v18.wrapper-run"
   sed -n '/^m8_wrapper_run()/,/^}/p' "$WRAPPER" >"$body"
-  version_line="$(grep -n 'm8_oss_versioning_guard "\$M8_PRECLAIM_DIR"' "$body" | head -n1 | cut -d: -f1)"
-  identity_line="$(grep -n 'm8_provider_identity_preclaim || return 1' "$body" | head -n1 | cut -d: -f1)"
-  claim_line="$(grep -n 'm8_claim_create || return 1' "$body" | head -n1 | cut -d: -f1)"
-  [[ -n "$version_line" && -n "$identity_line" && -n "$claim_line" ]] ||
-    { printf 'wrapper ordering anchors not found\n'; return 1; }
-  (( version_line < identity_line && identity_line < claim_line )) ||
-    { printf 'order must be versioning(%s) < identity(%s) < claim(%s)\n' "$version_line" "$identity_line" "$claim_line"; return 1; }
+  # R2I-C4/B03 pre-claim contract order. Every trust-target check that can affect
+  # where or how writes occur must precede the first mutating call (the claim).
+  local -a ordered=(
+    'm8_reject_synthetic_overrides || return 1'
+    'm8_reject_oss_trust_environment || return 1'
+    'm8_wrapper_init || return 1'
+    'm8_guard_static_binding || return 1'
+    'm8_guard_proof_checkout || return 1'
+    'm8_guard_clean_start || return 1'
+    'm8_oss_canonical_config_guard "$M8_PRECLAIM_DIR"'
+    'm8_ossutil_identity_guard "$M8_PRECLAIM_DIR"'
+    'm8_provider_identity_preclaim || return 1'
+    'm8_oss_observe_ecs_role_name || return 1'
+    'm8_prepare_oss_trust_profile || return 1'
+    'm8_oss_capability_guard "$M8_PRECLAIM_DIR"'
+    'm8_oss_bucket_location_guard "$M8_PRECLAIM_DIR"'
+    'm8_oss_versioning_guard "$M8_PRECLAIM_DIR"'
+    'm8_load_authorization || return 1'
+    'm8_already_committed_check || return 1'
+    'm8_claim_create || return 1'
+    'm8_evidence_initialize || return 1'
+  )
+  for anchor in "${ordered[@]}"; do
+    current="$(grep -n -F "$anchor" "$body" | head -n1 | cut -d: -f1)"
+    [[ -n "$current" ]] || { printf 'wrapper ordering anchor not found: %s\n' "$anchor"; missing=1; continue; }
+    (( current > previous )) ||
+      { printf 'wrapper order violated at %s (line %s <= %s)\n' "$anchor" "$current" "$previous"; return 1; }
+    previous="$current"
+  done
+  (( missing == 0 )) || return 1
 
   # Guards must fail closed even when called in a condition context.
   (
@@ -707,6 +885,8 @@ v20() {
     # shellcheck source=/dev/null
     source "$OSS_LIB"
     export M8_OSS_BUCKET='test-bucket' M8_OSSUTIL_BIN="$FAKE_OSSUTIL"
+    export M8_PROOF_ROOT="$REPO_ROOT"
+    export M8_OSS_ECS_ROLE_NAME='M8SyntheticObservedRole'
     export M8_FAKE_OSS_ROOT="$TMPROOT/v20-oss"
     mkdir -p "$M8_FAKE_OSS_ROOT"
     M8_FAKE_OSS_CAPABILITY=full m8_oss_capability_guard - || return 1
@@ -722,6 +902,8 @@ v21() {
     # shellcheck source=/dev/null
     source "$OSS_LIB"
     export M8_OSS_BUCKET='test-bucket' M8_OSSUTIL_BIN="$FAKE_OSSUTIL"
+    export M8_PROOF_ROOT="$REPO_ROOT"
+    export M8_OSS_ECS_ROLE_NAME='M8SyntheticObservedRole'
     export M8_FAKE_OSS_ROOT="$TMPROOT/v21-oss" M8_FAKE_OSS_VERSIONING='enabled'
     mkdir -p "$M8_FAKE_OSS_ROOT"
     if m8_oss_versioning_guard -; then printf 'versioning Enabled was accepted\n'; return 1; fi
@@ -733,6 +915,8 @@ v22() {
     # shellcheck source=/dev/null
     source "$OSS_LIB"
     export M8_OSS_BUCKET='test-bucket' M8_OSSUTIL_BIN="$FAKE_OSSUTIL"
+    export M8_PROOF_ROOT="$REPO_ROOT"
+    export M8_OSS_ECS_ROLE_NAME='M8SyntheticObservedRole'
     export M8_FAKE_OSS_ROOT="$TMPROOT/v22-oss" M8_FAKE_OSS_VERSIONING='suspended'
     mkdir -p "$M8_FAKE_OSS_ROOT"
     if m8_oss_versioning_guard -; then printf 'versioning Suspended was accepted\n'; return 1; fi
@@ -744,6 +928,8 @@ v23() {
     # shellcheck source=/dev/null
     source "$OSS_LIB"
     export M8_OSS_BUCKET='test-bucket' M8_OSSUTIL_BIN="$FAKE_OSSUTIL"
+    export M8_PROOF_ROOT="$REPO_ROOT"
+    export M8_OSS_ECS_ROLE_NAME='M8SyntheticObservedRole'
     mkdir -p "$TMPROOT/v23-oss"
     export M8_FAKE_OSS_ROOT="$TMPROOT/v23-oss"
     M8_FAKE_OSS_VERSIONING='unversioned' m8_oss_versioning_guard - || return 1
@@ -756,6 +942,8 @@ v24() {
     # shellcheck source=/dev/null
     source "$OSS_LIB"
     export M8_OSS_BUCKET='test-bucket' M8_OSSUTIL_BIN="$FAKE_OSSUTIL"
+    export M8_PROOF_ROOT="$REPO_ROOT"
+    export M8_OSS_ECS_ROLE_NAME='M8SyntheticObservedRole'
     mkdir -p "$TMPROOT/v24-oss"
     export M8_FAKE_OSS_ROOT="$TMPROOT/v24-oss"
     if M8_FAKE_OSS_VERSIONING='garbage' m8_oss_versioning_guard -; then
@@ -772,6 +960,8 @@ v25() {
     # shellcheck source=/dev/null
     source "$OSS_LIB"
     export M8_OSS_BUCKET='test-bucket' M8_OSSUTIL_BIN="$FAKE_OSSUTIL"
+    export M8_PROOF_ROOT="$REPO_ROOT"
+    export M8_OSS_ECS_ROLE_NAME='M8SyntheticObservedRole'
     export M8_FAKE_OSS_ROOT="$TMPROOT/v25-oss"
     mkdir -p "$M8_FAKE_OSS_ROOT"
     local first="$TMPROOT/v25-a.txt" second="$TMPROOT/v25-b.txt" rc=0
@@ -794,6 +984,8 @@ v26() {
     # shellcheck source=/dev/null
     source "$OSS_LIB"
     export M8_OSS_BUCKET='test-bucket' M8_OSSUTIL_BIN="$FAKE_OSSUTIL"
+    export M8_PROOF_ROOT="$REPO_ROOT"
+    export M8_OSS_ECS_ROLE_NAME='M8SyntheticObservedRole'
     export M8_FAKE_OSS_ROOT="$TMPROOT/v26-oss" M8_FAKE_OSS_MUTATION_LOG="$log"
     export M8_FAKE_OSS_VERSIONING='unversioned'
     mkdir -p "$M8_FAKE_OSS_ROOT"
@@ -1119,7 +1311,26 @@ bootstrap_retry_fixture() {
   export M8_PROOF_ROOT="$PROOF" M8_PROOF_HOST_STATE="$HOST" M8_PROOF_EVIDENCE_DIR="$EVIDENCE"
   export M8_SYNTHETIC_TEST_MODE=1 M8_OSS_BUCKET='test-bucket' M8_OSSUTIL_BIN="$FAKE_OSSUTIL"
   export M8_FAKE_OSS_ROOT="$FAKE_ROOT" M8_FAKE_OSS_VERSIONING='unversioned'
+  export M8_FAKE_OSS_LOCATION='cn-hongkong'
   export M8_EXECUTOR_ID="$M8_PROVIDER_EXECUTOR_ID"
+  export M8_IMDS_CURL_BIN="$(write_fake_imds_client)"
+  export M8_IMDS_BASE_URL='http://imds.invalid/latest'
+  export M8_FAKE_IMDS_ROLE_MODE='one'
+  export M8_FAKE_IMDS_ROLE_NAME='M8SyntheticObservedRole'
+
+  # R2I-C4/B03: derive the exact trust-profile digest the production guards will
+  # compute, in an isolated subshell so the fixture cannot drift from the real
+  # serialization implementation.
+  PROFILE_SHA="$( (
+    set -Eeuo pipefail
+    # shellcheck source=/dev/null
+    source "$REPO_ROOT/scripts/run-m8-proof.sh"
+    m8_wrapper_init >/dev/null 2>&1 || exit 1
+    establish_oss_trust_target >/dev/null 2>&1 || exit 1
+    printf '%s' "$OSS_TRUST_PROFILE_SHA256"
+  ) )" || return 1
+  [[ "$PROFILE_SHA" =~ ^[0-9a-f]{64}$ ]] || return 1
+  export PROFILE_SHA
 
   # A pre-existing sealed semantic run: archive + package index.
   SEMANTIC_AUTH="$(printf 'semantic-authorization' | sha256sum | cut -d' ' -f1)"
@@ -1143,18 +1354,19 @@ bootstrap_retry_fixture() {
   manifest_sha="$(sha256sum "$archive_root/proof-artifacts/artifact-manifest.sha256" | cut -d' ' -f1)"
   "$PYTHON" - "$PACKAGE_INDEX_LOCAL" "$archive_sha" "$archive_size" "$manifest_sha" \
     "$ARCHIVE_NAME" "$ARCHIVE_OBJECT" "$APPROVED_PROOF_SHA" "$APPROVED_PROOF_TREE" \
-    "$SEMANTIC_AUTH" <<'PY'
+    "$SEMANTIC_AUTH" "${M8_RETRY_FIXTURE_INDEX_PROFILE_SHA:-$PROFILE_SHA}" <<'PY'
 import json
 import sys
 
 (out, archive_sha, archive_size, manifest_sha, archive_name, archive_object,
- proof_sha, proof_tree, semantic_auth) = sys.argv[1:10]
+ proof_sha, proof_tree, semantic_auth, profile_sha) = sys.argv[1:11]
 document = {
     "schema": "linguagraph-m8-package-index/v1",
     "authorization_kind": "SEMANTIC",
     "authorization_sha256": semantic_auth,
     "semantic_auth_sha256": semantic_auth,
     "retry_auth_sha256": None,
+    "oss_trust_profile_sha256": profile_sha,
     "proof_sha": proof_sha,
     "proof_tree": proof_tree,
     "archive": {
@@ -1180,17 +1392,19 @@ PY
   RETRY_TOKEN='M8-EXI-01-RETRY-SYNTHETIC-TOKEN'
   RETRY_AUTH="$(printf '%s' "$RETRY_TOKEN" | sha256sum | cut -d' ' -f1)"
   "$PYTHON" - "$RETRY_ISSUED" "$APPROVED_PROOF_SHA" "$APPROVED_PROOF_TREE" \
-    "$SEMANTIC_AUTH" "$archive_sha" "$package_index_sha" "$ARCHIVE_NAME" "$RETRY_AUTH" <<'PY'
+    "$SEMANTIC_AUTH" "$archive_sha" "$package_index_sha" "$ARCHIVE_NAME" "$RETRY_AUTH" \
+    "$PROFILE_SHA" <<'PY'
 import json
 import sys
 
 (out, proof_sha, proof_tree, semantic_auth, archive_sha,
- package_index_sha, archive_name, retry_auth) = sys.argv[1:9]
+ package_index_sha, archive_name, retry_auth, profile_sha) = sys.argv[1:10]
 document = {
     "schema": "linguagraph-m8-durability-retry-authorization/v1",
     "authorization_kind": "DURABILITY_RETRY",
     "authorization_id": "M8-EXI-01-RETRY-SYNTHETIC",
     "authorization_sha256": retry_auth,
+    "oss_trust_profile_sha256": profile_sha,
     "semantic_auth_sha256": semantic_auth,
     "proof_sha": proof_sha,
     "proof_tree": proof_tree,
@@ -1234,6 +1448,8 @@ run_retry_success() {
   source "$REPO_ROOT/scripts/run-m8-proof.sh"
   m8_wrapper_init
   m8_guard_local_syntax || return 1
+  establish_oss_trust_target || return 1
+  [[ "$OSS_TRUST_PROFILE_SHA256" == "$PROFILE_SHA" ]] || return 1
   m8_load_authorization || return 1
   m8_claim_create || return 1
   m8_evidence_initialize || return 1
@@ -1251,6 +1467,7 @@ v39() {
     source "$WRAPPER"
     m8_wrapper_init
     m8_guard_local_syntax || return 1
+    establish_oss_trust_target || return 1
     m8_load_authorization || return 1
     m8_claim_create || return 1
     m8_evidence_initialize || return 1
@@ -1301,6 +1518,7 @@ v40() {
     source "$WRAPPER"
     m8_wrapper_init
     m8_guard_local_syntax || return 1
+    establish_oss_trust_target || return 1
     mkdir -p "$EVIDENCE"
     printf 'failed-semantic-run-evidence\n' >"$EVIDENCE/payload.txt"
     printf 'FAIL exit=1\n' >"$EVIDENCE/outcome.txt"
@@ -1377,6 +1595,8 @@ c01() {
     # shellcheck source=/dev/null
     source "$WRAPPER"
     m8_wrapper_init
+    establish_oss_trust_target || return 1
+    stage_semantic_issued_json || return 1
 
     # Two distinct tokens with IDENTICAL issued-document byte content derive
     # different authorization_sha256 object paths, and neither path is the
@@ -1424,6 +1644,8 @@ c02() {
     # shellcheck source=/dev/null
     source "$WRAPPER"
     m8_wrapper_init
+    establish_oss_trust_target || return 1
+    stage_semantic_issued_json || return 1
 
     local mismatched="$TMPROOT/c02-mismatched-issued.json"
     "$PYTHON" - "$ISSUED_LOCAL" "$mismatched" <<'PY'
@@ -1452,11 +1674,11 @@ PY
   )
 }
 
-# C03 — every synthetic seam is rejected by both production entrypoints.
+# C03 — every production override seam is rejected by both production entrypoints.
 c03() {
   local name out rc=0
   local -a unset_args=()
-  for name in "${SYNTHETIC_SEAM_VARS[@]}"; do
+  for name in "${SYNTHETIC_SEAM_VARS[@]}" "${OSS_TRUST_ENV_VARS[@]}"; do
     unset_args+=(-u "$name")
   done
 
@@ -1482,9 +1704,9 @@ c03() {
       { printf '%s: synthetic success was reported on a rejected invocation\n' "$name"; return 1; }
   done
 
-  # Direct production execution of the adapter must refuse the same seams before
-  # its formal-context guards.
-  for name in M8_IMDS_BASE_URL M8_OSSUTIL_BIN; do
+  # Direct production execution of the adapter must refuse the same seven seams
+  # before its formal-context guards.
+  for name in "${SYNTHETIC_SEAM_VARS[@]}"; do
     rc=0
     out="$(env "${unset_args[@]}" "$name=seam-probe" bash "$ADAPTER" 2>&1)" || rc=$?
     (( rc != 0 )) || { printf '%s did not make the adapter fail closed\n' "$name"; return 1; }
@@ -1551,6 +1773,8 @@ c05() {
     # shellcheck source=/dev/null
     source "$OSS_LIB"
     export M8_OSS_BUCKET='test-bucket' M8_OSSUTIL_BIN="$FAKE_OSSUTIL"
+    export M8_PROOF_ROOT="$REPO_ROOT"
+    export M8_OSS_ECS_ROLE_NAME='M8SyntheticObservedRole'
     export M8_FAKE_OSS_ROOT="$TMPROOT/c05-oss" M8_FAKE_OSS_VERSIONING='unversioned'
     export M8_FAKE_OSS_BODY_LOG="$TMPROOT/c05-body.log"
     mkdir -p "$M8_FAKE_OSS_ROOT"
@@ -1811,7 +2035,1223 @@ c09() {
 }
 
 # ===========================================================================
-printf '===== M8-HSDR-F02 R2E-B01 offline verification =====\n'
+# R2I-C1 regressions (I01..I02) — production executable-override rejection.
+#
+# These are independent of the historical V01-V40 / C01-C09 sets and own their
+# own counters. They invoke the two REAL production entrypoints in an isolated
+# offline environment (all other production seams unset) and rely on the
+# documented first-action seam guard, which guarantees no external I/O,
+# authorization consumption or host-state mutation can occur.
+# ===========================================================================
+
+# The actual seam names exposed at runtime by the shared production authority,
+# read in a fresh shell so no test-process state can influence the result.
+production_seam_names() {
+  bash -c 'source "$1"; printf "%s\n" "${M8_SYNTHETIC_SEAM_VARS[@]}"' _ "$SEAMS_LIB" | sort
+}
+
+# Independent expected set, hard-coded on purpose. This is an oracle, not a
+# restatement of the implementation array: production source = implementation,
+# this list = independent expectation.
+expected_seam_names() {
+  printf '%s\n' \
+    M8_SYNTHETIC_TEST_MODE \
+    M8_IMDS_BASE_URL \
+    M8_IMDS_CURL_BIN \
+    M8_OSSUTIL_BIN \
+    M8_OSSUTIL_GET_OUTPUT_FLAG \
+    M8_ADAPTER_SCRIPT_OVERRIDE \
+    M8_PYTHON_BIN | sort
+}
+
+# Shared shape for I01/I02: with exactly one seam set (and every other production
+# seam explicitly unset) both production entrypoints must fail closed through the
+# shared seam guard, before authorization/context processing, and must emit no
+# formal success marker.
+assert_seam_rejected_by_both_entrypoints() {
+  local name=$1 value=$2
+  local -a unset_args=()
+  local n out rc=0
+  for n in "${SYNTHETIC_SEAM_VARS[@]}" "${OSS_TRUST_ENV_VARS[@]}"; do unset_args+=(-u "$n"); done
+
+  # --- formal wrapper ---
+  rc=0
+  out="$(env "${unset_args[@]}" "$name=$value" bash "$WRAPPER" 2>&1)" || rc=$?
+  (( rc != 0 )) || { printf '%s: the formal wrapper accepted the override\n' "$name"; return 1; }
+  grep -Fq "$name is set" <<<"$out" ||
+    { printf '%s: wrapper diagnostic does not name the variable\n%s\n' "$name" "$out"; return 1; }
+  grep -Fq 'refuses offline synthetic overrides' <<<"$out" ||
+    { printf '%s: wrapper did not use the shared seam-refusal path\n%s\n' "$name" "$out"; return 1; }
+  ! grep -Fq 'missing single-use authorization' <<<"$out" ||
+    { printf '%s: wrapper reached the authorization guard before the seam guard\n' "$name"; return 1; }
+  ! grep -Fq 'HSDR_F02_FORMAL_RUN_COMMAND_RC' <<<"$out" ||
+    { printf '%s: a formal RC marker was emitted\n' "$name"; return 1; }
+
+  # --- formal adapter, executed directly ---
+  rc=0
+  out="$(env "${unset_args[@]}" "$name=$value" bash "$ADAPTER" 2>&1)" || rc=$?
+  (( rc != 0 )) || { printf '%s: the formal adapter accepted the override\n' "$name"; return 1; }
+  grep -Fq "$name is set" <<<"$out" ||
+    { printf '%s: adapter diagnostic does not name the variable\n%s\n' "$name" "$out"; return 1; }
+  grep -Fq 'refuses offline synthetic overrides' <<<"$out" ||
+    { printf '%s: adapter did not use the shared seam-refusal path\n%s\n' "$name" "$out"; return 1; }
+  ! grep -Fq 'M8_ADAPTER_MODE=' <<<"$out" ||
+    { printf '%s: the adapter reached its ordinary NONFORMAL/context refusal first\n' "$name"; return 1; }
+  return 0
+}
+
+# Capture pre-existing runtime paths so the negative tests only assert that the
+# rejected invocations CREATED nothing (they run against the real repo root).
+r2i_capture_pre_state() {
+  R2I_PRE_ARTIFACTS=0
+  R2I_PRE_CANDIDATE=0
+  R2I_PRE_HOSTSTATE=0
+  if [[ -e "$REPO_ROOT/proof-artifacts" ]]; then R2I_PRE_ARTIFACTS=1; fi
+  if [[ -e "$REPO_ROOT/candidate" ]]; then R2I_PRE_CANDIDATE=1; fi
+  if [[ -e "$HOME/.local/state/linguagraph-m8-proof" ]]; then R2I_PRE_HOSTSTATE=1; fi
+}
+
+r2i_assert_no_new_runtime_state() {
+  if (( R2I_PRE_ARTIFACTS == 0 )); then assert_no_file "$REPO_ROOT/proof-artifacts"; fi
+  if (( R2I_PRE_CANDIDATE == 0 )); then assert_no_file "$REPO_ROOT/candidate"; fi
+  if (( R2I_PRE_HOSTSTATE == 0 )); then assert_no_file "$HOME/.local/state/linguagraph-m8-proof"; fi
+  return 0
+}
+
+# I01 — M8_ADAPTER_SCRIPT_OVERRIDE must be rejected fail-closed in production.
+i01() {
+  # Named oracle, written out literally so it is never derived from the array.
+  local oracle_name='M8_ADAPTER_SCRIPT_OVERRIDE'
+  local probe="$TMPROOT/i01-adapter-probe.sh"
+  local sentinel="$TMPROOT/i01-adapter-sentinel"
+
+  assert_eq "$(production_seam_names)" "$(expected_seam_names)" \
+    'production seam authority exposes exactly the seven expected names'
+  grep -Fxq "$oracle_name" <(expected_seam_names) ||
+    { printf 'I01 oracle does not name %s\n' "$oracle_name"; return 1; }
+
+  # A harmless substituted adapter that would leave a sentinel if executed.
+  cat >"$probe" <<EOF
+#!/usr/bin/env bash
+: >"$sentinel"
+exit 0
+EOF
+  chmod +x "$probe"
+
+  r2i_capture_pre_state
+  assert_seam_rejected_by_both_entrypoints "$oracle_name" "$probe" || return 1
+
+  # The substituted adapter must never have been executed, and the rejected
+  # invocations must not have created the filesystem paths a real run creates.
+  assert_no_file "$sentinel"
+  r2i_assert_no_new_runtime_state
+  printf 'I01_ADAPTER_OVERRIDE_REJECTED=PASS\n'
+  return 0
+}
+
+# I02 — M8_PYTHON_BIN must be rejected fail-closed in production.
+i02() {
+  # Named oracle, written out literally so it is never derived from the array.
+  local oracle_name='M8_PYTHON_BIN'
+  local probe="$TMPROOT/i02-python-probe"
+  local sentinel="$TMPROOT/i02-python-sentinel"
+
+  grep -Fxq "$oracle_name" <(expected_seam_names) ||
+    { printf 'I02 oracle does not name %s\n' "$oracle_name"; return 1; }
+  grep -Fxq "$oracle_name" <(production_seam_names) ||
+    { printf 'I02: %s is absent from the shared production seam authority\n' "$oracle_name"; return 1; }
+
+  # A harmless substituted interpreter that would leave a sentinel if executed.
+  cat >"$probe" <<EOF
+#!/usr/bin/env bash
+: >"$sentinel"
+exit 0
+EOF
+  chmod +x "$probe"
+
+  r2i_capture_pre_state
+  assert_seam_rejected_by_both_entrypoints "$oracle_name" "$probe" || return 1
+
+  # The substituted interpreter must never have been executed, and the rejected
+  # invocations must not have created evidence/claim/candidate/host-state paths.
+  assert_no_file "$sentinel"
+  r2i_assert_no_new_runtime_state
+  printf 'I02_PYTHON_BIN_REJECTED=PASS\n'
+  return 0
+}
+
+# ===========================================================================
+# R2I-C4/B03 — closed OSS trust-target regressions (T01..T12).
+#
+# These are deliberately separate from V01..V40, C01..C09 and I01..I02: a green
+# legacy baseline is not evidence that the B03 trust-target boundary holds.
+# ===========================================================================
+
+# Read the live 19-name closed environment authority out of the shared seam
+# library in a fresh shell, so a test can never inherit a mutated in-process copy.
+b03_trust_env_names() {
+  bash -c 'source "$1" >/dev/null 2>&1; printf "%s\n" "${M8_OSS_TRUST_ENV_REJECT_VARS[@]}"' _ "$SEAMS_LIB"
+}
+
+b03_seam_names() {
+  bash -c 'source "$1" >/dev/null 2>&1; printf "%s\n" "${M8_SYNTHETIC_SEAM_VARS[@]}"' _ "$SEAMS_LIB"
+}
+
+# Write a synthetic ossutil that reports exactly one version string.
+b03_version_stub() {
+  local version=$1 path=$2
+  cat >"$path" <<EOF
+#!/usr/bin/env bash
+printf 'ossutil version ${version}\\n'
+EOF
+  chmod +x "$path"
+}
+
+t01() {
+  # Independent oracle for the closed trust-environment set. The production list
+  # is never used to validate itself.
+  local -a oracle=(
+    M8_OSSUTIL_CONFIG_FILE OSS_ACCESS_KEY_ID OSS_ACCESS_KEY_SECRET OSS_SESSION_TOKEN
+    OSS_ROLE_ARN OSS_ROLE_SESSION_NAME OSS_REGION OSS_ENDPOINT OSSUTIL_CONFIG_FILE
+    OSSUTIL_PROFILE ALIBABA_CLOUD_ECS_METADATA HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY
+    http_proxy https_proxy all_proxy no_proxy
+  )
+  assert_eq "${#oracle[@]}" '19' 'independent oracle cardinality'
+  assert_eq "$(b03_trust_env_names | sort | tr '\n' ' ')" \
+    "$(printf '%s\n' "${oracle[@]}" | sort | tr '\n' ' ')" 'closed trust-environment name set'
+  assert_eq "$(b03_trust_env_names | wc -l | tr -d ' ')" '19' 'closed set cardinality'
+
+  # The C1 seven-seam authority and the B03 nineteen-name authority are two
+  # distinct arrays in one shared file and must never be merged or duplicated.
+  assert_eq "$(b03_seam_names | wc -l | tr -d ' ')" '7' 'C1 seam cardinality'
+  assert_eq "$(grep -c '^readonly -a M8_SYNTHETIC_SEAM_VARS=(' "$SEAMS_LIB")" '1' 'single seam declaration'
+  assert_eq "$(grep -c '^readonly -a M8_OSS_TRUST_ENV_REJECT_VARS=(' "$SEAMS_LIB")" '1' 'single trust-env declaration'
+  local name
+  while IFS= read -r name; do
+    grep -qxF "  $name" <(sed -n '/M8_OSS_TRUST_ENV_REJECT_VARS=(/,/^)/p' "$SEAMS_LIB") &&
+      assert_fail "B03 list must not be merged into the C1 seam array: $name"
+  done < <(b03_seam_names)
+
+  # Every one of the nineteen names is rejected fail-closed by the real wrapper
+  # entrypoint, before authorization processing, with the value never echoed and
+  # with no formal/synthetic success marker.
+  local -a unsets=()
+  while IFS= read -r name; do unsets+=(-u "$name"); done < <(b03_trust_env_names)
+  while IFS= read -r name; do unsets+=(-u "$name"); done < <(b03_seam_names)
+
+  local out rc
+  for name in "${oracle[@]}"; do
+    rc=0
+    out="$(env "${unsets[@]}" "$name=M8C4PROBEVALUE" bash "$WRAPPER" 2>&1)" || rc=$?
+    (( rc != 0 )) || { printf 'T01: %s was accepted by the wrapper\n' "$name"; return 1; }
+    grep -Fq "$name is set" <<<"$out" ||
+      { printf 'T01: %s is not named in the rejection diagnostic:\n%s\n' "$name" "$out"; return 1; }
+    grep -Fq 'M8C4PROBEVALUE' <<<"$out" &&
+      { printf 'T01: %s value was echoed into the diagnostic\n' "$name"; return 1; }
+    grep -Fq 'missing single-use authorization' <<<"$out" &&
+      { printf 'T01: authorization was processed before the environment guard for %s\n' "$name"; return 1; }
+    grep -Fq 'HSDR_F02_FORMAL_RUN_COMMAND_RC' <<<"$out" &&
+      { printf 'T01: a formal RC marker was emitted for %s\n' "$name"; return 1; }
+    grep -Fq 'M8_SYNTHETIC_OUTCOME=OK' <<<"$out" &&
+      { printf 'T01: a synthetic success marker was emitted for %s\n' "$name"; return 1; }
+  done
+  return 0
+}
+
+t02() {
+  (
+    # shellcheck source=/dev/null
+    source "$OSS_LIB"
+    export M8_PROOF_ROOT="$REPO_ROOT" M8_OSS_BUCKET='test-bucket'
+    export M8_OSSUTIL_BIN="$FAKE_OSSUTIL" M8_OSS_ECS_ROLE_NAME='M8SyntheticObservedRole'
+    export M8_FAKE_OSS_ROOT="$TMPROOT/t02-oss" M8_FAKE_OSS_LOCATION='cn-hongkong'
+    export M8_FAKE_OSS_VERSIONING='unversioned'
+    export M8_FAKE_OSS_ARG_LOG="$TMPROOT/t02-args.log"
+    mkdir -p "$M8_FAKE_OSS_ROOT/objects"
+    : >"$M8_FAKE_OSS_ARG_LOG"
+
+    local body="$TMPROOT/t02-body.txt" config
+    config="$REPO_ROOT/scripts/config/m8-ossutil-formal.ini"
+    printf 'T02 payload\n' >"$body"
+
+    m8_oss_api put-object --bucket test-bucket --key runs/t02/a.txt --body "file://$body" --forbid-overwrite true >/dev/null
+    m8_oss_api head-object --bucket test-bucket --key runs/t02/a.txt >/dev/null
+    m8_oss_api get-object --bucket test-bucket --key runs/t02/a.txt >/dev/null
+    m8_oss_api get-bucket-versioning --bucket test-bucket >/dev/null
+    m8_oss_api get-bucket-location --bucket test-bucket >/dev/null
+
+    assert_eq "$(wc -l <"$M8_FAKE_OSS_ARG_LOG" | tr -d ' ')" '5' 'pinned invocation count'
+    local operation
+    for operation in put-object head-object get-object get-bucket-versioning get-bucket-location; do
+      assert_eq "$(grep -c "operation=$operation " "$M8_FAKE_OSS_ARG_LOG")" '1' "$operation issued through the pinned CLI"
+    done
+    assert_eq "$(grep -c "config_file=$config region=cn-hongkong endpoint=https://oss-cn-hongkong-internal.aliyuncs.com mode=EcsRamRole ecs_role_name=M8SyntheticObservedRole addressing_style=virtual ignore_env_var=yes forbidden=none" "$M8_FAKE_OSS_ARG_LOG")" \
+      '5' 'every call carries the exact frozen trust target'
+    assert_no_grep 'skip-verify-cert|access-key-id|access-key-secret|sts-token|ram-role-arn|role-session-name' "$M8_FAKE_OSS_ARG_LOG"
+
+    # The trust target cannot be assembled without an observed role, and the
+    # captured role name is the live observed value rather than a constant.
+    local missing_role=0
+    if M8_OSS_ECS_ROLE_NAME='' m8_oss_global_args 2>/dev/null; then missing_role=1; fi
+    assert_eq "$missing_role" '0' 'global args refuse an unobserved role'
+    assert_eq "$(M8_OSS_ECS_ROLE_NAME='M8OtherObservedRole' m8_oss_global_args; printf '%s\n' "${M8_OSS_GLOBAL_ARGS[@]}" | sed -n '10p')" \
+      'M8OtherObservedRole' 'role name is taken from the observation, not hard-coded'
+    assert_no_grep 'M8SyntheticObservedRole' "$OSS_LIB"
+
+    assert_eq "$M8_OSS_REGION" 'cn-hongkong' 'frozen region'
+    assert_eq "$M8_OSS_ENDPOINT" 'https://oss-cn-hongkong-internal.aliyuncs.com' 'frozen HTTPS internal endpoint'
+    assert_eq "$M8_OSS_ENDPOINT_CLASS" 'INTERNAL' 'frozen endpoint class'
+    assert_eq "$M8_OSS_NETWORK_POLICY" 'SAME_REGION_INTERNAL_ONLY' 'frozen network policy'
+    assert_eq "$M8_OSS_AUTH_MODE" 'EcsRamRole' 'frozen auth mode'
+    assert_eq "$M8_OSS_ADDRESSING_STYLE" 'virtual' 'frozen addressing style'
+    assert_eq "$M8_OSS_TLS_VERIFICATION" 'required' 'frozen TLS verification policy'
+    assert_eq "$M8_OSS_IGNORE_ENV_VARS" 'true' 'ambient OSS_ env vars are ignored'
+  )
+}
+
+t03() {
+  local config="$REPO_ROOT/scripts/config/m8-ossutil-formal.ini"
+  assert_file "$config"
+  assert_eq "$(wc -c <"$config" | tr -d '[:space:]')" '22' 'canonical config byte count'
+  assert_eq "$(sha256sum "$config" | cut -d' ' -f1)" \
+    '76e66fda3cb1279873039930dcf15834f56067434423781dbdd94d84de5a011e' 'canonical config digest'
+  assert_eq "$(printf '[default]\nlanguage=EN\n' | sha256sum | cut -d' ' -f1)" \
+    "$(sha256sum "$config" | cut -d' ' -f1)" 'canonical config exact bytes'
+  assert_eq "$(tr -cd '\r' <"$config" | wc -c | tr -d '[:space:]')" '0' 'canonical config has no CR'
+  assert_eq "$(head -c 3 "$config")" '[de' 'canonical config has no BOM'
+
+  (
+    # shellcheck source=/dev/null
+    source "$OSS_LIB"
+    export M8_OSS_BUCKET='test-bucket' M8_OSSUTIL_BIN="$FAKE_OSSUTIL"
+    local scratch="$TMPROOT/t03-tree"
+    mkdir -p "$scratch"
+    cp -a "$REPO_ROOT/scripts" "$scratch/"
+    export M8_PROOF_ROOT="$scratch"
+
+    m8_oss_canonical_config_guard - || { printf 'T03: the pristine canonical config was rejected\n'; return 1; }
+    assert_eq "$(m8_oss_canonical_config_path)" "$scratch/scripts/config/m8-ossutil-formal.ini" 'canonical path resolution'
+
+    local target="$scratch/scripts/config/m8-ossutil-formal.ini"
+    printf 'x' >>"$target"
+    if m8_oss_canonical_config_guard - 2>/dev/null; then
+      printf 'T03: a one-byte config mutation was accepted\n'; return 1
+    fi
+
+    rm -f "$target"
+    if m8_oss_canonical_config_guard - 2>/dev/null; then
+      printf 'T03: an absent canonical config was accepted\n'; return 1
+    fi
+
+    printf '[default]\nlanguage=EN\nendpoint=evil.example\n' >"$target"
+    if m8_oss_canonical_config_guard - 2>/dev/null; then
+      printf 'T03: a config carrying a forbidden endpoint key was accepted\n'; return 1
+    fi
+
+    rm -f "$target"
+    ln -s "$config" "$target"
+    if m8_oss_canonical_config_guard - 2>/dev/null; then
+      printf 'T03: a symlinked canonical config was accepted\n'; return 1
+    fi
+    rm -f "$target"
+
+    # An out-of-worktree config path can never be selected.
+    export M8_PROOF_ROOT="$REPO_ROOT"
+    assert_eq "$(m8_oss_canonical_config_path)" \
+      "$REPO_ROOT/scripts/config/m8-ossutil-formal.ini" 'canonical config path is proof-tree relative'
+  ) || return 1
+
+  # The library/wrapper never consume an ambient config or profile selector; the
+  # names appear only in comments, where they document the closure.
+  local library_code wrapper_code
+  library_code="$(grep -vE '^[[:space:]]*#' "$OSS_LIB" | grep -c 'M8_OSSUTIL_CONFIG_FILE\|OSSUTIL_PROFILE\|\.ossutilconfig' || true)"
+  assert_eq "$library_code" '0' 'no ambient config/profile selection in executable library code'
+  wrapper_code="$(grep -vE '^[[:space:]]*#' "$WRAPPER" | grep -c 'M8_OSSUTIL_CONFIG_FILE\|OSSUTIL_PROFILE\|OSSUTIL_CONFIG_FILE' || true)"
+  assert_eq "$wrapper_code" '0' 'no ambient config/profile selection in executable wrapper code'
+  # ...and the closed environment guard rejects them instead.
+  grep -qxF '  M8_OSSUTIL_CONFIG_FILE' <(sed -n '/M8_OSS_TRUST_ENV_REJECT_VARS=(/,/^)/p' "$SEAMS_LIB") ||
+    assert_fail 'M8_OSSUTIL_CONFIG_FILE is absent from the closed trust-environment set'
+  grep -qxF '  OSSUTIL_PROFILE' <(sed -n '/M8_OSS_TRUST_ENV_REJECT_VARS=(/,/^)/p' "$SEAMS_LIB") ||
+    assert_fail 'OSSUTIL_PROFILE is absent from the closed trust-environment set'
+  return 0
+}
+
+t04() {
+  (
+    # shellcheck source=/dev/null
+    source "$OSS_LIB"
+    export M8_PROOF_ROOT="$REPO_ROOT" M8_OSS_BUCKET='test-bucket'
+    export M8_OSS_ECS_ROLE_NAME='M8SyntheticObservedRole'
+    local dir="$TMPROOT/t04" stub
+    mkdir -p "$dir"
+
+    # A supported release is accepted and its live identity is recorded.
+    stub="$dir/ossutil-220"
+    b03_version_stub '2.2.0' "$stub"
+    M8_OSSUTIL_BIN="$stub" m8_ossutil_identity_guard - || { printf 'T04: ossutil 2.2.0 was rejected\n'; return 1; }
+    assert_eq "$M8_OSSUTIL_VERSION" '2.2.0' 'parsed version'
+    assert_eq "$M8_OSSUTIL_ABSOLUTE_PATH" "$stub" 'resolved absolute path'
+    assert_eq "$M8_OSSUTIL_BINARY_SHA256" "$(sha256sum "$stub" | cut -d' ' -f1)" 'recorded binary digest'
+
+    stub="$dir/ossutil-231"
+    b03_version_stub '2.3.1' "$stub"
+    M8_OSSUTIL_BIN="$stub" m8_ossutil_identity_guard - || { printf 'T04: ossutil 2.3.1 was rejected\n'; return 1; }
+    assert_eq "$M8_OSSUTIL_VERSION" '2.3.1' 'later supported version parsed'
+
+    # Below the minimum is refused: --ignore-env-var requires 2.2.0.
+    stub="$dir/ossutil-210"
+    b03_version_stub '2.1.0' "$stub"
+    if M8_OSSUTIL_BIN="$stub" m8_ossutil_identity_guard - 2>/dev/null; then
+      printf 'T04: ossutil 2.1.0 was accepted below the 2.2.0 minimum\n'; return 1
+    fi
+
+    # Unparseable version output is refused.
+    stub="$dir/ossutil-garbage"
+    printf '#!/usr/bin/env bash\nprintf "this is not a version\\n"\n' >"$stub"
+    chmod +x "$stub"
+    if M8_OSSUTIL_BIN="$stub" m8_ossutil_identity_guard - 2>/dev/null; then
+      printf 'T04: unparseable version output was accepted\n'; return 1
+    fi
+
+    # A non-executable or absent binary is refused.
+    stub="$dir/ossutil-noexec"
+    b03_version_stub '2.2.0' "$stub"
+    chmod -x "$stub"
+    if M8_OSSUTIL_BIN="$stub" m8_ossutil_identity_guard - 2>/dev/null; then
+      printf 'T04: a non-executable ossutil was accepted\n'; return 1
+    fi
+    if M8_OSSUTIL_BIN="$dir/absent-ossutil" m8_ossutil_identity_guard - 2>/dev/null; then
+      printf 'T04: an absent ossutil was accepted\n'; return 1
+    fi
+
+    # The recorded digest is over the resolved bytes, so a mutation changes the
+    # trust-profile digest and invalidates any prior binding.
+    stub="$dir/ossutil-mutable"
+    b03_version_stub '2.2.0' "$stub"
+    M8_OSSUTIL_BIN="$stub" m8_ossutil_identity_guard - || return 1
+    local before after
+    before="$(m8_oss_trust_profile_sha256)"
+    printf '# mutated after identity capture\n' >>"$stub"
+    M8_OSSUTIL_BIN="$stub" m8_ossutil_identity_guard - || return 1
+    after="$(m8_oss_trust_profile_sha256)"
+    [[ "$before" != "$after" ]] ||
+      { printf 'T04: an ossutil binary mutation did not change the trust profile\n'; return 1; }
+
+    assert_eq "$M8_OSS_MIN_VERSION" '2.2.0' 'frozen minimum ossutil version'
+  )
+}
+
+t05() {
+  (
+    # shellcheck source=/dev/null
+    source "$OSS_LIB"
+    export M8_PROOF_ROOT="$REPO_ROOT" M8_OSS_BUCKET='test-bucket'
+    export M8_OSSUTIL_BIN="$FAKE_OSSUTIL" M8_OSS_ECS_ROLE_NAME='M8SyntheticObservedRole'
+    export M8_FAKE_OSS_ROOT="$TMPROOT/t05-oss" M8_FAKE_OSS_VERSIONING='unversioned'
+    export M8_FAKE_OSS_MUTATION_LOG="$TMPROOT/t05-mut.log"
+    export M8_FAKE_OSS_ARG_LOG="$TMPROOT/t05-args.log"
+    mkdir -p "$M8_FAKE_OSS_ROOT/objects"
+    : >"$M8_FAKE_OSS_MUTATION_LOG"
+    : >"$M8_FAKE_OSS_ARG_LOG"
+
+    M8_FAKE_OSS_LOCATION='cn-hongkong' m8_oss_bucket_location_guard - ||
+      { printf 'T05: the correct in-region bucket location was rejected\n'; return 1; }
+    assert_eq "$M8_OSS_BUCKET_LOCATION_OBSERVED" 'oss-cn-hongkong' 'observed bucket location recorded'
+    assert_eq "$(grep -c '^READ get-bucket-location test-bucket' "$M8_FAKE_OSS_MUTATION_LOG")" '1' 'location read issued'
+    assert_no_grep '^WRITE' "$M8_FAKE_OSS_MUTATION_LOG"
+
+    local state
+    for state in wrong-region empty garbage denied; do
+      : >"$M8_FAKE_OSS_MUTATION_LOG"
+      if M8_FAKE_OSS_LOCATION="$state" m8_oss_bucket_location_guard - 2>/dev/null; then
+        printf 'T05: bucket location state %s was accepted\n' "$state"; return 1
+      fi
+      assert_eq "$(grep -c '^READ get-bucket-location' "$M8_FAKE_OSS_MUTATION_LOG")" '1' "$state performed exactly one read"
+      assert_no_grep '^WRITE' "$M8_FAKE_OSS_MUTATION_LOG"
+    done
+
+    # A rejected location is recorded in the existing pre-claim evidence file, so
+    # B03 rides in PHASE-A artifacts that already exist.
+    local evidence="$TMPROOT/t05-preclaim"
+    mkdir -p "$evidence"
+    M8_FAKE_OSS_LOCATION='wrong-region' m8_oss_bucket_location_guard "$evidence" 2>/dev/null || true
+    assert_contains "$evidence/oss-versioning-guard.txt" 'bucket_location=REJECTED:oss-cn-hangzhou'
+    assert_eq "$(grep -c 'get_bucket_location_rc=' "$evidence/oss-versioning-guard.txt")" '1' 'location rc recorded once'
+    assert_eq "$M8_OSS_BUCKET_LOCATION" 'oss-cn-hongkong' 'required canonical bucket location'
+  )
+}
+
+t06() {
+  (
+    # shellcheck source=/dev/null
+    source "$IDENTITY_LIB"
+    export M8_IMDS_CURL_BIN="$(write_fake_imds_client)"
+    export M8_IMDS_BASE_URL='http://imds.invalid/latest'
+    export M8_FAKE_IMDS_LOG="$TMPROOT/t06-imds.log"
+    : >"$M8_FAKE_IMDS_LOG"
+
+    # PASS: exactly one valid role.
+    local name
+    name="$(M8_FAKE_IMDS_ROLE_MODE='one' M8_FAKE_IMDS_ROLE_NAME='M8SyntheticObservedRole' \
+      m8_provider_identity_observe_ecs_role_name)" ||
+      { printf 'T06: a single-role observation failed\n'; return 1; }
+    assert_eq "$name" 'M8SyntheticObservedRole' 'observed role name'
+
+    # FAIL: zero, multiple, CR/control ambiguity.
+    local mode
+    for mode in zero multiple control; do
+      if M8_FAKE_IMDS_ROLE_MODE="$mode" m8_provider_identity_observe_ecs_role_name >/dev/null 2>&1; then
+        printf 'T06: IMDS role mode %s was accepted\n' "$mode"; return 1
+      fi
+    done
+
+    # FAIL: a REAL NUL byte in the LIST response (R2I-C5_B01 / R2I-C6).
+    # The real production helper is invoked; this is not a source-text check.
+    local nul_out="$TMPROOT/t06-nul.out" nul_err="$TMPROOT/t06-nul.err" nul_rc=0
+    : >"$nul_out"
+    : >"$nul_err"
+    M8_FAKE_IMDS_ROLE_MODE='nul' m8_provider_identity_observe_ecs_role_name \
+      >"$nul_out" 2>"$nul_err" || nul_rc=$?
+    (( nul_rc != 0 )) ||
+      { printf 'T06: a real-NUL role-name response was ACCEPTED (rc=%s)\n' "$nul_rc"; return 1; }
+    assert_contains "$nul_err" 'ECS role-name response contains a NUL byte'
+    assert_contains "$nul_err" 'NUL'
+    assert_eq "$(wc -c <"$nul_out" | tr -d '[:space:]')" '0' 'no validated role emitted for a NUL response'
+    assert_no_grep 'M8SyntheticObservedRole|M8SyntheticNulSuffix' "$nul_out"
+    # The corrected data flow never puts the raw NUL body through command
+    # substitution, so Bash must not emit its lossy warning on either stream.
+    assert_no_grep 'ignored null byte in input' "$nul_err"
+    assert_no_grep 'ignored null byte in input' "$nul_out"
+
+    # The `nul` fixture must genuinely carry byte 00: materialize it and inspect
+    # the bytes, so a regression to printable backslash-zero is caught too.
+    local nul_fixture="$TMPROOT/t06-nul-fixture.bin"
+    M8_FAKE_IMDS_LOG='' M8_FAKE_IMDS_ROLE_MODE='nul' \
+      "$M8_IMDS_CURL_BIN" "$M8_IMDS_BASE_URL/meta-data/ram/security-credentials/" >"$nul_fixture"
+    "$PYTHON" - "$nul_fixture" <<'PY' || return 1
+import sys
+
+with open(sys.argv[1], "rb") as handle:
+    data = handle.read()
+if b"\\0" in data:
+    sys.stderr.write("T06: the nul fixture encodes printable backslash-zero: %r\n" % data)
+    raise SystemExit(1)
+if data.count(b"\x00") != 1:
+    sys.stderr.write(
+        "T06: expected exactly one real NUL byte, got %d in %r\n" % (data.count(b"\x00"), data)
+    )
+    raise SystemExit(1)
+sys.stdout.write("T06_NUL_FIXTURE_HEX=%s\n" % data.hex())
+PY
+
+    # Only the token endpoint and the role-name LIST endpoint are ever requested:
+    # one accepted case plus four rejected cases.
+    assert_eq "$(grep -c '/api/token$' "$M8_FAKE_IMDS_LOG")" '5' 'token requests'
+    assert_eq "$(grep -c 'meta-data/ram/security-credentials/$' "$M8_FAKE_IMDS_LOG")" '5' 'role-name list requests'
+    assert_no_grep 'meta-data/ram/security-credentials/.+' "$M8_FAKE_IMDS_LOG"
+    assert_no_grep 'AccessKeyId|AccessKeySecret|SecurityToken|CredentialExpiration|TokenExpiration' "$M8_FAKE_IMDS_LOG"
+
+    # Static: the LIST body is streamed to the scratch file and never
+    # materialised in a shell variable; the helper creates no host state.
+    local helper_file="$TMPROOT/t06-helper-body.txt"
+    sed -n '/^m8_provider_identity_observe_ecs_role_name()/,/^}/p' "$IDENTITY_LIB" >"$helper_file"
+    assert_contains "$helper_file" '>"$raw_file"'
+    assert_no_contains "$helper_file" '$(m8_imds_get'
+    assert_no_contains "$helper_file" 'printf'
+    assert_no_grep 'mkdir' "$helper_file"
+
+    # Static: the observation helper never interpolates a role name into the
+    # credential-payload path, and the credential endpoint is never requested.
+    assert_no_grep 'security-credentials/\$' "$IDENTITY_LIB"
+    assert_no_grep 'security-credentials/"' "$IDENTITY_LIB"
+    assert_contains "$IDENTITY_LIB" "M8_IMDS_ECS_ROLE_LIST_REL='meta-data/ram/security-credentials/'"
+  )
+}
+
+t07() {
+  (
+    # shellcheck source=/dev/null
+    source "$OSS_LIB"
+    export M8_PROOF_ROOT="$REPO_ROOT" M8_OSS_BUCKET='test-bucket'
+    export M8_OSS_ECS_ROLE_NAME='M8SyntheticObservedRole'
+    export M8_OSSUTIL_VERSION='2.2.0'
+    export M8_OSSUTIL_BINARY_SHA256="$(sha256sum "$FAKE_OSSUTIL" | cut -d' ' -f1)"
+
+    # Independent order oracle for the frozen 18-record serialization.
+    local -a order=(
+      schema oss_bucket oss_region effective_oss_endpoint endpoint_class network_policy
+      addressing_style oss_auth_mode ecs_role_name ossutil_version ossutil_binary_sha256
+      config_relpath config_sha256 config_profile config_policy_id ignore_oss_env_vars
+      env_policy_id tls_verification
+    )
+    assert_eq "${#order[@]}" '18' 'frozen trust-profile field count'
+    assert_eq "$(m8_oss_trust_profile_values | cut -d= -f1 | tr '\n' ' ')" \
+      "$(printf '%s ' "${order[@]}")" 'frozen trust-profile field order'
+    assert_eq "$(m8_oss_trust_profile_values | grep -c '^[a-z0-9_]*=')" '18' 'record count'
+    m8_oss_trust_profile_assert_canonical || { printf 'T07: the canonical profile was rejected\n'; return 1; }
+
+    # Serialization identity: key=value LF records, exactly one trailing LF, one
+    # LF per record, and no CR/NUL anywhere.
+    assert_eq "$(m8_oss_trust_profile_values | tr -cd '\n' | wc -c | tr -d '[:space:]')" '18' 'one LF per record'
+    assert_eq "$(m8_oss_trust_profile_values | tail -c 1 | od -An -tx1 | tr -d ' \n')" '0a' 'exactly one final LF'
+    assert_eq "$(m8_oss_trust_profile_values | tr -cd '\r\000' | wc -c | tr -d '[:space:]')" '0' 'no CR or NUL'
+    assert_eq "$(m8_oss_trust_profile_values | LC_ALL=C grep -c '^[ -~]*$')" '18' 'records are plain ASCII'
+
+    local digest
+    digest="$(m8_oss_trust_profile_sha256)"
+    [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || { printf 'T07: profile digest is not a SHA-256\n'; return 1; }
+    assert_eq "$digest" "$(m8_oss_trust_profile_values | sha256sum | cut -d' ' -f1)" \
+      'digest is SHA256 of the exact serialized bytes'
+    assert_eq "$digest" "$(m8_oss_trust_profile_values | sha256sum | cut -d' ' -f1)" \
+      'digest is stable across invocations'
+
+    # Every live binding must move the digest, and the order must be contractual.
+    local zero_sha='0000000000000000000000000000000000000000000000000000000000000000'
+    [[ "$(M8_OSS_BUCKET='test-bucket-two' m8_oss_trust_profile_sha256)" != "$digest" ]] ||
+      { printf 'T07: a bucket change did not change the profile digest\n'; return 1; }
+    [[ "$(M8_OSS_ECS_ROLE_NAME='M8OtherObservedRole' m8_oss_trust_profile_sha256)" != "$digest" ]] ||
+      { printf 'T07: a role change did not change the profile digest\n'; return 1; }
+    [[ "$(M8_OSSUTIL_VERSION='2.2.1' m8_oss_trust_profile_sha256)" != "$digest" ]] ||
+      { printf 'T07: an ossutil version change did not change the profile digest\n'; return 1; }
+    [[ "$(M8_OSSUTIL_BINARY_SHA256="$zero_sha" m8_oss_trust_profile_sha256)" != "$digest" ]] ||
+      { printf 'T07: an ossutil binary change did not change the profile digest\n'; return 1; }
+    [[ "$(m8_oss_trust_profile_values | tac | sha256sum | cut -d' ' -f1)" != "$digest" ]] ||
+      { printf 'T07: a reordered profile hashed identically\n'; return 1; }
+
+    # Missing live values fail closed rather than emitting a partial profile.
+    local emitted=0
+    if M8_OSS_ECS_ROLE_NAME='' m8_oss_trust_profile_values >/dev/null 2>&1; then emitted=1; fi
+    assert_eq "$emitted" '0' 'profile refuses an unestablished role'
+    emitted=0
+    if M8_OSSUTIL_VERSION='' m8_oss_trust_profile_values >/dev/null 2>&1; then emitted=1; fi
+    assert_eq "$emitted" '0' 'profile refuses an unestablished ossutil version'
+    emitted=0
+    if M8_OSSUTIL_BINARY_SHA256='' m8_oss_trust_profile_values >/dev/null 2>&1; then emitted=1; fi
+    assert_eq "$emitted" '0' 'profile refuses an unestablished binary digest'
+  )
+}
+
+t08() {
+  (
+    bootstrap_formal_fixture
+    # shellcheck source=/dev/null
+    source "$WRAPPER"
+    m8_wrapper_init
+    m8_guard_local_syntax || return 1
+    establish_oss_trust_target || return 1
+
+    export M8_FAKE_OSS_MUTATION_LOG="$TMPROOT/t08-mut.log"
+    : >"$M8_FAKE_OSS_MUTATION_LOG"
+
+    local profile="$OSS_TRUST_PROFILE_SHA256"
+    [[ "$profile" =~ ^[0-9a-f]{64}$ ]] || { printf 'T08: no local trust profile was established\n'; return 1; }
+
+    # The exactly bound authorization is accepted.
+    stage_semantic_issued_json "$profile" || return 1
+    m8_load_authorization || { printf 'T08: a correctly bound authorization was rejected\n'; return 1; }
+    assert_eq "$ISSUED_PROFILE_SHA256" "$profile" 'issued trust-profile binding adopted'
+    assert_no_grep '^WRITE' "$M8_FAKE_OSS_MUTATION_LOG"
+
+    # Missing carrier, malformed carrier and a different valid digest all fail
+    # closed before any claim (or any other mutating call) is attempted.
+    local case_dir="$TMPROOT/t08" stage
+    mkdir -p "$case_dir"
+    for stage in missing malformed different; do
+      : >"$M8_FAKE_OSS_MUTATION_LOG"
+      case "$stage" in
+        missing)   json_edit "$ISSUED_LOCAL" "$case_dir/$stage.json" drop oss_trust_profile_sha256 ;;
+        malformed) json_edit "$ISSUED_LOCAL" "$case_dir/$stage.json" set oss_trust_profile_sha256 'not-a-sha256' ;;
+        different) json_edit "$ISSUED_LOCAL" "$case_dir/$stage.json" set oss_trust_profile_sha256 \
+                     '1111111111111111111111111111111111111111111111111111111111111111' ;;
+      esac
+      stage_object "authorizations/$AUTH/issued.json" "$case_dir/$stage.json"
+      if m8_load_authorization 2>/dev/null; then
+        printf 'T08: a %s trust-profile binding was accepted\n' "$stage"; return 1
+      fi
+      assert_no_grep '^WRITE' "$M8_FAKE_OSS_MUTATION_LOG"
+      assert_no_file "$M8_FAKE_OSS_ROOT/objects/$M8_OSS_BUCKET/$CLAIM_OBJECT"
+    done
+
+    # Recovery proves the failures above were caused by the profile binding and
+    # not by a consumed single-use lock: the correct document loads again.
+    stage_object "authorizations/$AUTH/issued.json" "$ISSUED_LOCAL"
+    m8_load_authorization || { printf 'T08: the corrected authorization could not be re-loaded\n'; return 1; }
+    assert_eq "$ISSUED_PROFILE_SHA256" "$profile" 'recovered trust-profile binding'
+  )
+}
+
+t09() {
+  run_formal_success || { printf 'T09: the semantic fixture failed\n'; return 1; }
+
+  local profile
+  profile="$(m8_json_get "$M8_SEAL_DIR/package-index.json" oss_trust_profile_sha256)"
+  [[ "$profile" =~ ^[0-9a-f]{64}$ ]] ||
+    { printf 'T09: the local package index carries no trust-profile digest\n'; return 1; }
+
+  assert_eq "$(m8_json_get "$M8_FAKE_OSS_ROOT/objects/$M8_OSS_BUCKET/$PACKAGE_INDEX_OBJECT" oss_trust_profile_sha256)" \
+    "$profile" 'sealed package-index binding'
+  assert_eq "$(m8_json_get "$M8_FAKE_OSS_ROOT/objects/$M8_OSS_BUCKET/$CLAIM_OBJECT" oss_trust_profile_sha256)" \
+    "$profile" 'claim binding'
+  assert_eq "$(m8_json_get "$M8_FAKE_OSS_ROOT/objects/$M8_OSS_BUCKET/$RECEIPT_OBJECT" oss_trust_profile_sha256)" \
+    "$profile" 'receipt top-level binding'
+  assert_eq "$(m8_json_get "$M8_FAKE_OSS_ROOT/objects/$M8_OSS_BUCKET/$RECEIPT_OBJECT" cross_binding.oss_trust_profile_sha256)" \
+    "$profile" 'receipt cross-binding'
+
+  # The digest is the SHA-256 of the recorded 18-record host-local profile.
+  local recorded="$M8_PRECLAIM_DIR/oss-trust-profile.txt"
+  assert_file "$recorded"
+  assert_eq "$(sha256sum "$recorded" | cut -d' ' -f1)" "$profile" 'recorded profile digest identity'
+  assert_eq "$(grep -c '^[a-z0-9_]*=' "$recorded")" '18' 'recorded profile field count'
+
+  # The three writers agree with each other and with the approved proof identity.
+  assert_eq "$(m8_json_get "$M8_FAKE_OSS_ROOT/objects/$M8_OSS_BUCKET/$PACKAGE_INDEX_OBJECT" proof_sha)" \
+    "$APPROVED_PROOF_SHA" 'package-index proof identity'
+  assert_eq "$(m8_json_get "$M8_FAKE_OSS_ROOT/objects/$M8_OSS_BUCKET/$RECEIPT_OBJECT" package_index_sha256)" \
+    "$(sha256sum "$M8_FAKE_OSS_ROOT/objects/$M8_OSS_BUCKET/$PACKAGE_INDEX_OBJECT" | cut -d' ' -f1)" \
+    'receipt binds the sealed package index'
+  assert_eq "$(m8_json_get "$M8_FAKE_OSS_ROOT/objects/$M8_OSS_BUCKET/$RECEIPT_OBJECT" claim_sha256)" \
+    "$(sha256sum "$M8_FAKE_OSS_ROOT/objects/$M8_OSS_BUCKET/$CLAIM_OBJECT" | cut -d' ' -f1)" \
+    'receipt binds the claim'
+  return 0
+}
+
+t10() {
+  run_formal_success || { printf 'T10: the semantic fixture failed\n'; return 1; }
+
+  local receipt="$M8_FAKE_OSS_ROOT/objects/$M8_OSS_BUCKET/$RECEIPT_OBJECT"
+  local verifier="$REPO_ROOT/scripts/verify-m8-closure-receipt.py"
+  local profile
+  profile="$(m8_json_get "$receipt" oss_trust_profile_sha256)"
+  [[ "$profile" =~ ^[0-9a-f]{64}$ ]] || { printf 'T10: the receipt carries no trust-profile digest\n'; return 1; }
+
+  "$PYTHON" "$verifier" --receipt "$receipt" --expect-oss-trust-profile-sha256 "$profile" >/dev/null ||
+    { printf 'T10: the verifier rejected a correctly bound receipt\n'; return 1; }
+  "$PYTHON" "$verifier" --receipt "$receipt" >/dev/null ||
+    { printf 'T10: the verifier rejected a self-consistent receipt\n'; return 1; }
+
+  local case_dir="$TMPROOT/t10"
+  mkdir -p "$case_dir"
+  # Each expected carrier is load-bearing: removing either must fail closed.
+  json_edit "$receipt" "$case_dir/no-top.json" drop oss_trust_profile_sha256
+  if "$PYTHON" "$verifier" --receipt "$case_dir/no-top.json" >/dev/null 2>&1; then
+    printf 'T10: a receipt without the top-level trust-profile binding was accepted\n'; return 1
+  fi
+  json_edit "$receipt" "$case_dir/no-cross.json" drop cross_binding.oss_trust_profile_sha256
+  if "$PYTHON" "$verifier" --receipt "$case_dir/no-cross.json" >/dev/null 2>&1; then
+    printf 'T10: a receipt without the trust-profile cross-binding was accepted\n'; return 1
+  fi
+  json_edit "$receipt" "$case_dir/malformed.json" set oss_trust_profile_sha256 'not-a-sha256'
+  if "$PYTHON" "$verifier" --receipt "$case_dir/malformed.json" >/dev/null 2>&1; then
+    printf 'T10: a receipt with a malformed trust-profile digest was accepted\n'; return 1
+  fi
+  json_edit "$receipt" "$case_dir/inconsistent.json" set cross_binding.oss_trust_profile_sha256 \
+    '3333333333333333333333333333333333333333333333333333333333333333'
+  if "$PYTHON" "$verifier" --receipt "$case_dir/inconsistent.json" >/dev/null 2>&1; then
+    printf 'T10: a divergent trust-profile cross-binding was accepted\n'; return 1
+  fi
+  # A conflicting Human expectation must fail closed.
+  if "$PYTHON" "$verifier" --receipt "$receipt" \
+      --expect-oss-trust-profile-sha256 '4444444444444444444444444444444444444444444444444444444444444444' >/dev/null 2>&1; then
+    printf 'T10: the verifier accepted a conflicting expected trust profile\n'; return 1
+  fi
+
+  # The expectation flag is genuinely wired into the verifier, not accepted and
+  # ignored.
+  assert_contains "$verifier" 'expect_oss_trust_profile_sha256'
+  return 0
+}
+
+t11() {
+  (
+    # The pre-existing semantic package index is bound to a different trust
+    # profile than the retry host observes: the retry must fail closed.
+    export M8_RETRY_FIXTURE_INDEX_PROFILE_SHA='5555555555555555555555555555555555555555555555555555555555555555'
+    bootstrap_retry_fixture || { printf 'T11: the retry fixture failed\n'; return 1; }
+    # shellcheck source=/dev/null
+    source "$WRAPPER"
+    m8_wrapper_init
+    m8_guard_local_syntax || return 1
+    establish_oss_trust_target || return 1
+    assert_eq "$OSS_TRUST_PROFILE_SHA256" "$PROFILE_SHA" 'retry trust-profile identity'
+
+    export M8_FAKE_OSS_MUTATION_LOG="$TMPROOT/t11-mut.log"
+    : >"$M8_FAKE_OSS_MUTATION_LOG"
+    m8_load_authorization || return 1
+    m8_claim_create || return 1
+    if m8_phase_b_seal 2>/dev/null; then
+      printf 'T11: a retry sealed an index bound to a different trust profile\n'; return 1
+    fi
+
+    # The mismatch is detected before any further mutating call: the atomic claim
+    # is the only object written, and no receipt is produced.
+    assert_eq "$(grep -c '^WRITE' "$M8_FAKE_OSS_MUTATION_LOG")" '1' 'only the atomic claim was written'
+    assert_grep "^WRITE put-object $CLAIM_OBJECT\$" "$M8_FAKE_OSS_MUTATION_LOG"
+    assert_no_file "$M8_FAKE_OSS_ROOT/objects/$M8_OSS_BUCKET/$RECEIPT_OBJECT"
+  ) || return 1
+
+  # The matching trust profile still retries successfully and never reruns the
+  # core or the adapter.
+  (
+    run_retry_success || { printf 'T11: the matching retry succeeded path failed\n'; return 1; }
+    assert_no_file "$EVIDENCE/stages.txt"
+    assert_no_file "$EVIDENCE/adapter-raw.log"
+  )
+}
+
+t12() {
+  (
+    export M8_FAKE_OSS_MUTATION_LOG="$TMPROOT/t12-mut.log"
+    : >"$M8_FAKE_OSS_MUTATION_LOG"
+    run_formal_success >/dev/null || { printf 'T12: the semantic fixture failed\n'; return 1; }
+    local log="$TMPROOT/t12-mut.log"
+    assert_file "$log"
+
+    # The first permitted mutating call of the whole formal run is the atomic
+    # claim; nothing is written before it.
+    assert_eq "$(grep -n '^WRITE' "$log" | head -n1 | sed 's/:.*//')" \
+      "$(grep -n "^WRITE put-object $CLAIM_OBJECT\$" "$log" | cut -d: -f1)" \
+      'the first write is the atomic claim'
+    assert_eq "$(grep -c '^WRITE' "$log" | tr -d ' ')" '4' 'exactly four canonical writes'
+    assert_eq "$(grep -c "^WRITE put-object $ARCHIVE_OBJECT\$" "$log")" '1' 'archive written once'
+    assert_eq "$(grep -c "^WRITE put-object $PACKAGE_INDEX_OBJECT\$" "$log")" '1' 'package index written once'
+    assert_eq "$(grep -c "^WRITE put-object $RECEIPT_OBJECT\$" "$log")" '1' 'receipt written once'
+    assert_eq "$(grep -c "^WRITE put-object $CLAIM_OBJECT\$" "$log")" '1' 'claim written once'
+
+    # All read-only trust-target establishment strictly precedes the first write.
+    local first_write location versioning
+    first_write="$(grep -n '^WRITE' "$log" | head -n1 | cut -d: -f1)"
+    location="$(grep -n '^READ get-bucket-location' "$log" | head -n1 | cut -d: -f1)"
+    versioning="$(grep -n '^READ get-bucket-versioning' "$log" | head -n1 | cut -d: -f1)"
+    [[ -n "$location" && -n "$versioning" ]] ||
+      { printf 'T12: the read-only trust-target reads were never issued\n'; return 1; }
+    (( location < first_write )) ||
+      { printf 'T12: bucket location was not read before the first write\n'; return 1; }
+    (( versioning < first_write )) ||
+      { printf 'T12: bucket versioning was not read before the first write\n'; return 1; }
+
+    # B03 provenance rides in the existing PHASE-A wrapper-provenance.txt
+    # artifact; no new artifact is introduced, and every recorded value is live.
+    local provenance="$EVIDENCE/wrapper-provenance.txt"
+    assert_file "$provenance"
+    assert_contains "$provenance" "oss_trust_profile_sha256=$(m8_json_get "$M8_FAKE_OSS_ROOT/objects/$M8_OSS_BUCKET/$RECEIPT_OBJECT" oss_trust_profile_sha256)"
+    assert_contains "$provenance" 'bucket_location_observed=oss-cn-hongkong'
+    # The offline fixture drives the phase functions directly, so the entrypoint
+    # guard never ran; the provenance reports that honestly rather than claiming
+    # a pass. The entrypoint assignment itself is asserted statically below.
+    assert_contains "$provenance" 'environment_guard=NOT_RUN'
+    assert_contains "$provenance" 'oss_trust_profile_field_count=18'
+    assert_eq "$(sed -n '/^schema=/,$p' "$provenance" | grep -c '^[a-z0-9_]*=')" '18' 'provenance records the full 18-field profile'
+    assert_no_grep '^bucket_location_observed=$' "$provenance"
+    assert_no_grep '^oss_trust_profile_sha256=$' "$provenance"
+    assert_no_grep '^ossutil_absolute_path=$' "$provenance"
+
+    # The entrypoint marks the closed-environment guard as PASS only after both
+    # reject guards and well before the claim.
+    local body="$TMPROOT/t12.wrapper-run" guard_line pass_line claim_call first_put
+    sed -n '/^m8_wrapper_run()/,/^}/p' "$WRAPPER" >"$body"
+    guard_line="$(grep -n 'm8_reject_oss_trust_environment || return 1' "$body" | cut -d: -f1)"
+    pass_line="$(grep -n "ENVIRONMENT_GUARD_STATE='PASS'" "$body" | cut -d: -f1)"
+    claim_call="$(grep -n 'm8_claim_create || return 1' "$body" | head -n1 | cut -d: -f1)"
+    [[ -n "$guard_line" && -n "$pass_line" && -n "$claim_call" ]] ||
+      { printf 'T12: the entrypoint guard ordering anchors are missing\n'; return 1; }
+    (( guard_line < pass_line && pass_line < claim_call )) ||
+      { printf 'T12: environment_guard=PASS is not set between the guard and the claim\n'; return 1; }
+
+    # Static: the wrapper cannot reach a PutObject before the claim call.
+    first_put="$(grep -n 'm8_oss_put_object\|m8_oss_api put-object' "$body" | head -n1 | cut -d: -f1)"
+    [[ -z "$first_put" || "$claim_call" -le "$first_put" ]] ||
+      { printf 'T12: the wrapper can reach a PutObject before the claim\n'; return 1; }
+  )
+}
+
+# ===========================================================================
+# R2I-C7 — immutable provider-identity binary-safety regressions (P01..P04).
+#
+# These exercise the REAL production provider verifier and the REAL preflight
+# through an offline fake IMDS that serves raw payload bytes verbatim (including
+# NUL). They are deliberately separate from V/C/I/T: the legacy suite fabricates
+# the provider capture outputs and never drives the live verification path.
+# ===========================================================================
+
+# Offline IMDS client for the provider probes. Serves M8_FAKE_PROVIDER_DIR/<rel>
+# byte-for-byte with `cat`, so a NUL in a payload reaches the production
+# classifier unchanged. Also implements the tokenless 403 probe and token mode.
+write_fake_imds_provider_client() {
+  local path="$TMPROOT/fake-imds-provider-curl.sh"
+  cat >"$path" <<'FAKEPROVIDER'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+url=''; token_header='no'; put='no'; output=''
+args=("$@")
+i=0
+while (( i < ${#args[@]} )); do
+  case "${args[$i]}" in
+    http://*|https://*) url="${args[$i]}" ;;
+    -H)
+      i=$((i + 1))
+      case "${args[$i]:-}" in X-aliyun-ecs-metadata-token:*) token_header='yes' ;; esac
+      ;;
+    -X)
+      i=$((i + 1))
+      [[ "${args[$i]:-}" == 'PUT' ]] && put='yes'
+      ;;
+    --output) i=$((i + 1)); output="${args[$i]:-}" ;;
+  esac
+  i=$((i + 1))
+done
+if [[ -n "${M8_FAKE_PROVIDER_LOG:-}" ]]; then printf '%s\n' "$url" >>"$M8_FAKE_PROVIDER_LOG"; fi
+if [[ "$token_header" == 'no' ]]; then
+  # Tokenless probe: the reviewed contract is an HTTP 403.
+  printf '403'
+  exit 0
+fi
+if [[ "$put" == 'yes' && "$url" == */api/token ]]; then
+  printf 'SYNTHETIC-PROVIDER-TOKEN-NOT-A-SECRET\n'
+  exit 0
+fi
+base="${M8_FAKE_PROVIDER_BASE:?M8_FAKE_PROVIDER_BASE is required}"
+rel="${url#"$base"/}"
+payload="${M8_FAKE_PROVIDER_DIR:?M8_FAKE_PROVIDER_DIR is required}/$rel"
+if [[ ! -f "$payload" ]]; then
+  printf 'Error: no synthetic provider payload for %s\n' "$rel" >&2
+  exit 22
+fi
+if [[ -n "$output" && "$output" != '/dev/null' ]]; then
+  cp -f "$payload" "$output"
+else
+  cat "$payload"
+fi
+exit 0
+FAKEPROVIDER
+  chmod +x "$path"
+  printf '%s' "$path"
+}
+
+# Raw payload writers. Bytes are written straight to the file: the NUL is never
+# routed through a shell variable or command substitution.
+provider_payload_write() { # dir rel value
+  local dir=$1 rel=$2 value=$3
+  mkdir -p "$dir/$(dirname "$rel")"
+  printf '%s\n' "$value" >"$dir/$rel"
+}
+
+provider_payload_write_nul() { # dir rel prefix suffix  -> prefix NUL suffix (no LF)
+  local dir=$1 rel=$2 prefix=$3 suffix=$4
+  mkdir -p "$dir/$(dirname "$rel")"
+  printf '%s\0%s' "$prefix" "$suffix" >"$dir/$rel"
+}
+
+# The suite's existing clean synthetic immutable payloads.
+provider_payload_dir_clean() {
+  local dir=$1
+  rm -rf "$dir"
+  mkdir -p "$dir"
+  provider_payload_write "$dir" meta-data/instance-id "$EXPECTED_INSTANCE_ID"
+  provider_payload_write "$dir" meta-data/region-id "$EXPECTED_REGION_ID"
+  provider_payload_write "$dir" meta-data/zone-id "$EXPECTED_ZONE_ID"
+  provider_payload_write "$dir" meta-data/instance/instance-type "$EXPECTED_INSTANCE_TYPE"
+  provider_payload_write "$dir" meta-data/image-id "$EXPECTED_IMAGE_ID"
+  provider_payload_write "$dir" dynamic/instance-identity/document 'synthetic-identity-document'
+  provider_payload_write "$dir" dynamic/instance-identity/pkcs7 'synthetic-identity-pkcs7'
+}
+
+# Independent proof that a fixture really carries one real 0x00 byte.
+provider_assert_single_nul() { # file label
+  "$PYTHON" - "$1" "$2" <<'PY' || return 1
+import sys
+
+path, label = sys.argv[1], sys.argv[2]
+with open(path, "rb") as handle:
+    data = handle.read()
+if data.count(b"\x00") != 1:
+    sys.stderr.write(
+        "fixture %s must contain exactly one real NUL byte, got %d in %r\n"
+        % (label, data.count(b"\x00"), data)
+    )
+    raise SystemExit(1)
+sys.stdout.write("NUL_FIXTURE_OK %s bytes=%d hex=%s\n" % (label, len(data), data.hex()))
+PY
+}
+
+# Drive the REAL m8_provider_identity_verify against the offline fake IMDS. The
+# pure tuple comparison is recorded rather than performed, so a probe can prove
+# whether a malformed value ever reached it.
+provider_verify_probe() { # payload_dir result_file [capture_dir]
+  local dir=$1 result=$2 capture=${3:-'-'}
+  (
+    # shellcheck source=/dev/null
+    source "$IDENTITY_LIB"
+    export M8_IMDS_CURL_BIN="$(write_fake_imds_provider_client)"
+    export M8_IMDS_BASE_URL='http://imds.invalid/latest'
+    export M8_FAKE_PROVIDER_BASE="$M8_IMDS_BASE_URL"
+    export M8_FAKE_PROVIDER_DIR="$dir"
+    local tuple_file="$TMPROOT/provider-assert-tuple.txt"
+    local out="$TMPROOT/provider-probe-out.txt" err="$TMPROOT/provider-probe-err.txt"
+    : >"$tuple_file"
+    : >"$out"
+    : >"$err"
+    m8_provider_identity_assert() { printf '%s\n' "$*" >>"$tuple_file"; return 0; }
+    local rc=0
+    m8_provider_identity_verify "$capture" >"$out" 2>"$err" || rc=$?
+    {
+      printf 'verify_rc=%s\n' "$rc"
+      printf 'assert_calls=%s\n' "$(wc -l <"$tuple_file" | tr -d '[:space:]')"
+      printf 'assert_tuple=%s\n' "$(head -n1 "$tuple_file")"
+      printf 'probe_stdout=%s\n' "$(cat "$out")"
+      printf 'probe_stderr=%s\n' "$(cat "$err")"
+    } >"$result"
+  )
+}
+
+p01() {
+  (
+    # shellcheck source=/dev/null
+    source "$IDENTITY_LIB"
+    p01_body
+  )
+}
+
+p01_body() {
+  # Five scalar immutable inputs, each carrying one REAL NUL such that deleting
+  # the NUL would restore the frozen expected value. All five must fail closed
+  # before the tuple comparison.
+  local dir="$TMPROOT/p01" result="$TMPROOT/p01-result.txt"
+  local -a cases=(
+    'meta-data/instance-id|i-j6|c9854oyawy89fcdxy2|EXPECTED_INSTANCE_ID'
+    'meta-data/region-id|cn-|hongkong|EXPECTED_REGION_ID'
+    'meta-data/zone-id|cn-h|ongkong-d|EXPECTED_ZONE_ID'
+    'meta-data/instance/instance-type|ecs.|g9i.xlarge|EXPECTED_INSTANCE_TYPE'
+    'meta-data/image-id|ubuntu_|24_04_x64_20G_alibase_20260916.vhd|EXPECTED_IMAGE_ID'
+  )
+  local case rel prefix suffix var value
+  for case in "${cases[@]}"; do
+    IFS='|' read -r rel prefix suffix var <<<"$case"
+    value="${!var}"
+    # The NUL must split the frozen value exactly: deleting it restores `value`.
+    assert_eq "${prefix}${suffix}" "$value" "P01 $var NUL split reconstructs the expected value"
+    provider_payload_dir_clean "$dir"
+    provider_payload_write_nul "$dir" "$rel" "$prefix" "$suffix"
+    provider_assert_single_nul "$dir/$rel" "$var" || return 1
+    provider_verify_probe "$dir" "$result"
+    assert_eq "$(sed -n 's/^assert_calls=//p' "$result")" '0' \
+      "P01 $var: a NUL value must never reach the tuple comparison"
+    assert_eq "$(sed -n 's/^verify_rc=//p' "$result")" '1' "P01 $var: a NUL value must fail closed"
+    assert_contains "$result" 'NUL'
+    assert_no_grep 'ignored null byte in input' "$result"
+  done
+  # The region case is the exact 12-byte probe from the C7 contract.
+  local region_probe="$TMPROOT/p01-region-probe.bin"
+  provider_payload_dir_clean "$dir"
+  provider_payload_write_nul "$dir" meta-data/region-id 'cn-' 'hongkong'
+  cp -f "$dir/meta-data/region-id" "$region_probe"
+  assert_eq "$(wc -c <"$region_probe" | tr -d '[:space:]')" '12' 'region NUL probe byte length'
+  assert_eq "$(sha256sum "$region_probe" | cut -d' ' -f1)" \
+    'e417c238ce2121c0144c412e2d1552d1da24320a87140141974bc4fab3112fd9' 'region NUL probe digest'
+  return 0
+}
+
+p02() {
+  (
+    # shellcheck source=/dev/null
+    source "$IDENTITY_LIB"
+    p02_body
+  )
+}
+
+p02_body() {
+  # The identity document and PKCS7 carry one REAL NUL each. Both must fail
+  # before any canonical digest is accepted, and the clean payloads must still
+  # produce the pre-C7 canonical digests.
+  local dir="$TMPROOT/p02" result="$TMPROOT/p02-result.txt"
+  local -a cases=(
+    'dynamic/instance-identity/document|synthetic-identity-|document|document'
+    'dynamic/instance-identity/pkcs7|synthetic-identity-|pkcs7|pkcs7'
+  )
+  local case rel prefix suffix label
+  for case in "${cases[@]}"; do
+    IFS='|' read -r rel prefix suffix label <<<"$case"
+    provider_payload_dir_clean "$dir"
+    provider_payload_write_nul "$dir" "$rel" "$prefix" "$suffix"
+    provider_assert_single_nul "$dir/$rel" "$label" || return 1
+    provider_verify_probe "$dir" "$result"
+    assert_eq "$(sed -n 's/^assert_calls=//p' "$result")" '0' \
+      "P02 $label: a NUL body must never reach digest acceptance"
+    assert_eq "$(sed -n 's/^verify_rc=//p' "$result")" '1' "P02 $label: a NUL body must fail closed"
+    assert_contains "$result" 'NUL'
+    assert_no_grep 'ignored null byte in input' "$result"
+  done
+  return 0
+}
+
+p03() {
+  (
+    # shellcheck source=/dev/null
+    source "$IDENTITY_LIB"
+    p03_body
+  )
+}
+
+p03_body() {
+  # The REAL preflight immutable-identity path, driven offline, with a NUL in the
+  # region response. Preflight must fail in the identity section and must never
+  # emit a normalised region or a PASS verdict.
+  local dir="$TMPROOT/p03" stub="$TMPROOT/p03-bin"
+  local out="$TMPROOT/p03-out.txt" err="$TMPROOT/p03-err.txt"
+  provider_payload_dir_clean "$dir"
+  provider_payload_write_nul "$dir" meta-data/region-id 'cn-' 'hongkong'
+  provider_assert_single_nul "$dir/meta-data/region-id" 'preflight-region' || return 1
+
+  # This host reports less than the preflight's ~16 GiB minimum; only the
+  # MemTotal read is synthesised. Every other awk call passes through.
+  local real_awk
+  real_awk="$(command -v awk)"
+  rm -rf "$stub"
+  mkdir -p "$stub"
+  cat >"$stub/awk" <<STUB
+#!/usr/bin/env bash
+if [[ "\${1:-}" == '/MemTotal:/ {print \$2}' && "\${2:-}" == '/proc/meminfo' ]]; then
+  printf '32000000\n'
+  exit 0
+fi
+exec $real_awk "\$@"
+STUB
+  chmod +x "$stub/awk"
+
+  local rc=0
+  (
+    cd "$TMPROOT"
+    PATH="$stub:$PATH" \
+      M8_IMDS_BASE_URL='http://imds.invalid/latest' \
+      M8_IMDS_CURL_BIN="$(write_fake_imds_provider_client)" \
+      M8_FAKE_PROVIDER_BASE='http://imds.invalid/latest' \
+      M8_FAKE_PROVIDER_DIR="$dir" \
+      bash "$PREFLIGHT"
+  ) >"$out" 2>"$err" || rc=$?
+
+  (( rc != 0 )) || { printf 'P03: the preflight accepted a NUL region response\n'; return 1; }
+  assert_no_contains "$out" 'provider_identity_match=PASS'
+  # The reviewed-constant echo at the top of the report legitimately prints the
+  # FROZEN region. The live observation section must never emit a normalised one,
+  # so scope the assertion to that section.
+  local live="$TMPROOT/p03-live.txt"
+  sed -n '/^--- live read-only IMDS observation ---$/,$p' "$out" >"$live"
+  assert_file "$live"
+  assert_no_grep '^region_id=' "$live"
+  assert_no_grep '^region_id=cn-hongkong$' "$live"
+  # The failure must be attributed to the byte-safe region read, not to an
+  # unrelated later check.
+  assert_contains "$err" 'PREFLIGHT_FAIL: region-id read failed (byte-safe)'
+  # It must have failed inside the identity section, never reaching the network
+  # section (this test is fully offline).
+  assert_no_contains "$out" 'frozen static binding'
+  assert_grep 'NUL' "$err"
+  assert_no_grep 'ignored null byte in input' "$err"
+  assert_no_grep 'ignored null byte in input' "$out"
+
+  # Static: preflight must not command-substitute any immutable endpoint read.
+  local offenders="$TMPROOT/p03-offenders.txt"
+  grep -nE 'instance-id|region-id|zone-id|instance-type|image-id|instance-identity' "$PREFLIGHT" \
+    | grep -E '\$\(m8_imds_get' >"$offenders" || true
+  assert_eq "$(wc -l <"$offenders" | tr -d '[:space:]')" '0' \
+    'preflight must not command-substitute an immutable endpoint read'
+  assert_contains "$PREFLIGHT" 'm8_provider_identity_scalar_read'
+  assert_contains "$PREFLIGHT" 'm8_provider_identity_digest_read'
+  return 0
+}
+
+p04() {
+  (
+    # shellcheck source=/dev/null
+    source "$IDENTITY_LIB"
+    p04_body
+  )
+}
+
+p04_body() {
+  # Clean semantic compatibility: for clean synthetic payloads the byte-safe path
+  # must produce exactly the pre-C7 values and canonical digests, and the capture
+  # files must stay byte-compatible. This proves C7 is a binary-safety correction
+  # and not an implicit provider rebind.
+  local dir="$TMPROOT/p04" result="$TMPROOT/p04-result.txt"
+  local capture="$TMPROOT/p04-capture"
+  provider_payload_dir_clean "$dir"
+  provider_verify_probe "$dir" "$result"
+  assert_eq "$(sed -n 's/^assert_calls=//p' "$result")" '1' \
+    'clean payloads must reach the tuple comparison exactly once'
+  assert_eq "$(sed -n 's/^verify_rc=//p' "$result")" '0' 'clean payloads must verify'
+  assert_no_grep 'ignored null byte in input' "$result"
+
+  local tuple
+  tuple="$(sed -n 's/^assert_tuple=//p' "$result")"
+  [[ -n "$tuple" ]] || { printf 'P04: the tuple comparison recorded nothing\n'; return 1; }
+
+  # Independently recompute the pre-C7 semantics: command substitution stripped
+  # trailing LFs; the capture/digest form was printf '%s\n' of the result.
+  "$PYTHON" - "$dir" "$tuple" <<'PY' || return 1
+import hashlib
+import sys
+
+payload_dir, tuple_line = sys.argv[1], sys.argv[2]
+observed = tuple_line.split()
+scalars = [
+    ("meta-data/instance-id", 0),
+    ("meta-data/region-id", 1),
+    ("meta-data/zone-id", 2),
+    ("meta-data/instance/instance-type", 3),
+    ("meta-data/image-id", 4),
+]
+if len(observed) != 7:
+    sys.stderr.write("P04: expected 7 tuple fields, got %d: %r\n" % (len(observed), observed))
+    raise SystemExit(1)
+
+for rel, index in scalars:
+    with open("%s/%s" % (payload_dir, rel), "rb") as handle:
+        raw = handle.read()
+    # former Bash: value=$(...)  ->  trailing LF bytes removed
+    expected = raw.rstrip(b"\n").decode("utf-8")
+    if observed[index] != expected:
+        sys.stderr.write("P04: %s observed %r, pre-C7 oracle %r\n" % (rel, observed[index], expected))
+        raise SystemExit(1)
+
+for rel, index, label in (
+    ("dynamic/instance-identity/document", 5, "document"),
+    ("dynamic/instance-identity/pkcs7", 6, "pkcs7"),
+):
+    with open("%s/%s" % (payload_dir, rel), "rb") as handle:
+        raw = handle.read()
+    # former Bash: printf '%s\n' "$(get)" | sha256sum
+    canonical = raw.rstrip(b"\n") + b"\n"
+    expected = hashlib.sha256(canonical).hexdigest()
+    if observed[index] != expected:
+        sys.stderr.write("P04: %s digest observed %s, pre-C7 oracle %s\n" % (label, observed[index], expected))
+        raise SystemExit(1)
+print("P04_PRE_C7_ORACLE_MATCH=YES")
+PY
+
+  # Capture-mode byte compatibility.
+  rm -rf "$capture"
+  mkdir -p "$capture"
+  provider_verify_probe "$dir" "$TMPROOT/p04-capture-result.txt" "$capture" || return 1
+  assert_eq "$(sed -n 's/^verify_rc=//p' "$TMPROOT/p04-capture-result.txt")" '0' 'clean capture probe must verify'
+  assert_contains "$capture/primary/instance-id.txt" "$EXPECTED_INSTANCE_ID"
+  assert_contains "$capture/primary/instance-identity-document.json" 'synthetic-identity-document'
+  assert_eq "$(wc -c <"$capture/primary/instance-identity-document.json" | tr -d '[:space:]')" \
+    "$(printf 'synthetic-identity-document\n' | wc -c | tr -d '[:space:]')" 'document capture byte length'
+  assert_eq "$(sha256sum "$capture/primary/instance-identity-document.json" | cut -d' ' -f1)" \
+    "$(sha256sum "$dir/dynamic/instance-identity/document" | cut -d' ' -f1)" 'document capture bytes are the canonical payload'
+  assert_eq "$(tr -d '\n' <"$capture/primary/instance-identity-document.sha256")" \
+    "$(sed -n 's/^assert_tuple=//p' "$result" | awk '{print $6}')" 'document digest file matches the observed digest'
+  assert_eq "$(tr -d '\n' <"$capture/primary/instance-identity-pkcs7.sha256")" \
+    "$(sed -n 's/^assert_tuple=//p' "$result" | awk '{print $7}')" 'pkcs7 digest file matches the observed digest'
+
+  # No scratch file may survive any of the provider reads.
+  assert_eq "$(find "${TMPDIR:-/tmp}" -maxdepth 1 \( -name 'm8-provider-scalar.*' -o -name 'm8-provider-document.*' \) 2>/dev/null | wc -l | tr -d '[:space:]')" \
+    '0' 'provider scratch files must not leak'
+  return 0
+}
+
+# ===========================================================================
+printf '===== M8-HSDR-F02 R2E-B01 + R2I-C1 offline verification =====\n'
 printf 'repo=%s\n' "$REPO_ROOT"
 
 for f in "$WRAPPER" "$CORE" "$ADAPTER" "$PREFLIGHT" "$OSS_LIB" "$IDENTITY_LIB" \
@@ -1863,7 +3303,7 @@ run_check synth V40 'a retry never reruns core/adapter and writes only canonical
 printf '\n----- R2E-B01 correction regressions (C01..C09) -----\n'
 run_check corr C01 'B1 token -> authorization_sha256; no issued.json self-reference' c01
 run_check corr C02 'B1 mismatched issued.json.authorization_sha256 fails closed' c02
-run_check corr C03 'B2 both production entrypoints reject all five synthetic seams' c03
+run_check corr C03 'B2 both production entrypoints reject all seven production override seams' c03
 run_check corr C04 'B3 JSON report uses the reporter rootDir-relative spec namespace' c04
 run_check corr C05 'B4 every PutObject uses the official file:// body form' c05
 run_check corr C06 'B5 completeness rejects unexpected/unclassified artifacts' c06
@@ -1871,12 +3311,39 @@ run_check corr C07 'B5 required-list duplicates/absolute/traversal/globs are rej
 run_check corr C08 'B5 manifest exact-set, self-hash and digest validation' c08
 run_check corr C09 'R2E-B01 reserved manifest is exactly one root-relative path' c09
 
+printf '\n----- R2I-C1 regressions (I01..I02) -----\n'
+run_check r2i I01 'M8_ADAPTER_SCRIPT_OVERRIDE rejected fail-closed by both entrypoints' i01
+run_check r2i I02 'M8_PYTHON_BIN rejected fail-closed by both entrypoints' i02
+
+printf '\n----- R2I-C4/B03 trust-target regressions (T01..T12) -----\n'
+run_check r2i_c4 T01 'closed 19-name OSS trust environment, separate from the 7 C1 seams' t01
+run_check r2i_c4 T02 'every API call is issued through the exact frozen CLI trust target' t02
+run_check r2i_c4 T03 'canonical proof-tree inert config identity and fail-closed mutation' t03
+run_check r2i_c4 T04 'ossutil path/version/binary identity with a 2.2.0 minimum' t04
+run_check r2i_c4 T05 'bucket-location guard rejects non-canonical locations before any write' t05
+run_check r2i_c4 T06 'read-only single role-name observation; credential payload never requested' t06
+run_check r2i_c4 T07 '18-record trust-profile canonicalization and digest sensitivity' t07
+run_check r2i_c4 T08 'issued authorization binds the exact trust profile before claim' t08
+run_check r2i_c4 T09 'claim, package index and receipt all bind the trust profile' t09
+run_check r2i_c4 T10 'receipt carriers and verifier expectation are load-bearing' t10
+run_check r2i_c4 T11 'retry trust-target mismatch fails closed; matching retry never reruns core' t11
+run_check r2i_c4 T12 'pre-claim order: first permitted write is the atomic claim' t12
+
+printf '\n----- R2I-C7 provider binary-safety regressions (P01..P04) -----\n'
+run_check r2i_c7 P01 'five scalar immutable NUL bypasses fail closed before the tuple comparison' p01
+run_check r2i_c7 P02 'identity document and PKCS7 NUL bodies fail before digest acceptance' p02
+run_check r2i_c7 P03 'preflight uses the shared byte-safe authority for immutable inputs' p03
+run_check r2i_c7 P04 'clean provider semantics and canonical digests match the pre-C7 oracle' p04
+
 printf '\n===== summary =====\n'
 printf 'R2E_B01_LEGACY_V01_V40=%s/%s\n' \
   "$((STATIC_PASS + SYNTH_PASS))" "$((STATIC_TOTAL + SYNTH_TOTAL))"
 printf 'R2E_B01_CORRECTION_REGRESSIONS=%s/%s\n' "$CORR_PASS" "$CORR_TOTAL"
 printf 'R2E_B01_STATIC_CHECKS=%s/%s\n' "$STATIC_PASS" "$STATIC_TOTAL"
 printf 'R2E_B01_SYNTHETIC_CHECKS=%s/%s\n' "$SYNTH_PASS" "$SYNTH_TOTAL"
+printf 'R2I_C1_REGRESSIONS=%s/%s\n' "$R2I_PASS" "$R2I_TOTAL"
+printf 'R2I_C4_B03_REGRESSIONS=%s/%s\n' "$R2I_C4_PASS" "$R2I_C4_TOTAL"
+printf 'R2I_C7_PROVIDER_BINARY_REGRESSIONS=%s/%s\n' "$R2I_C7_PASS" "$R2I_C7_TOTAL"
 if ((${#FAILED_CHECKS[@]})); then
   printf 'R2E_B01_OFFLINE_VERIFICATION=FAIL failed=%s\n' "${FAILED_CHECKS[*]}"
   exit 1
