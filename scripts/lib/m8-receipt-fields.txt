@@ -1,0 +1,66 @@
+# Required field paths of a valid M8-HSDR-F02 closure receipt (PASS only).
+#
+# Dotted paths are resolved against the receipt JSON document by
+# scripts/verify-m8-closure-receipt.py. A field must be present; explicit JSON
+# null is acceptable only where the verifier's semantic rules allow it.
+#
+# The field `terminal_line` is deliberately NOT part of this schema and is
+# rejected if present: the formal RC terminal marker is emitted exactly once by
+# the wrapper process, it is not embedded in the receipt.
+#
+# cross_binding.* mirrors the sealed digests in both directions so a receipt can
+# never be self-consistent while pointing at archive/index bytes that were
+# re-derived or mutated after sealing.
+#
+# authorization_sha256 is the SHA-256 of the exact Human-issued authorization
+# TOKEN string and is deliberately NOT the digest of the issued document.
+# issued_document_sha256 carries the exact issued-document byte identity as a
+# separate, semantically distinct receipt field computed by the wrapper over the
+# retrieved bytes. It is never demanded from inside the document, because a
+# document can never contain a correct digest of its own bytes.
+
+schema
+closure_outcome
+authorization_kind
+authorization_sha256
+semantic_auth_sha256
+retry_auth_sha256
+claim_sha256
+claim_object
+issued_object
+issued_document_sha256
+proof_sha
+proof_tree
+candidate_sha
+candidate_tree
+candidate_parent
+frozen_main
+executor_id
+authorized_executor_id
+provider_identity.instance_id
+provider_identity.region_id
+provider_identity.zone_id
+provider_identity.instance_type
+provider_identity.image_id
+provider_identity.identity_document_sha256
+provider_identity.identity_pkcs7_sha256
+run_prefix
+archive_name
+archive_object
+archive_sha256
+archive_size_bytes
+artifact_manifest_sha256
+package_index_sha256
+package_index_object
+core_exit_code
+adapter_exit_code
+formal_execution_rc
+playwright_effective_retries
+formal_command_rc
+execution_started_utc
+committed_utc
+cross_binding.sealed_archive_sha256
+cross_binding.package_index_archive_sha256
+cross_binding.manifest_sha256
+cross_binding.issued_document_sha256
+cross_binding.claim_object_sha256

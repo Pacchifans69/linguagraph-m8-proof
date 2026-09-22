@@ -1,0 +1,87 @@
+{
+  "config": {
+    "configFile": "playwright.config.ts",
+    "rootDir": ".",
+    "projects": [{"name": "chromium", "retries": 0}]
+  },
+  "errors": [],
+  "suites": [
+    {
+      "title": "e2e/golden-path.spec.ts",
+      "file": "e2e/golden-path.spec.ts",
+      "specs": [
+        {"column": 1, "file": "e2e/golden-path.spec.ts", "id": "000000000000000000000000a5a50001", "line": 3, "ok": true, "status": "expected", "tags": [], "tests": [{"projectName": "chromium", "results": [{"retry": 0, "status": "passed"}], "status": "expected"}], "title": "golden-path :: case 01"},
+        {"column": 1, "file": "e2e/golden-path.spec.ts", "id": "000000000000000000000000a5a50002", "line": 9, "ok": true, "status": "expected", "tags": [], "tests": [{"projectName": "chromium", "results": [{"retry": 0, "status": "passed"}], "status": "expected"}], "title": "golden-path :: case 02"},
+        {"column": 1, "file": "e2e/golden-path.spec.ts", "id": "000000000000000000000000a5a50003", "line": 15, "ok": true, "status": "expected", "tags": [], "tests": [{"projectName": "chromium", "results": [{"retry": 0, "status": "passed"}], "status": "expected"}], "title": "golden-path :: case 03"},
+        {"column": 1, "file": "e2e/golden-path.spec.ts", "id": "000000000000000000000000a5a50004", "line": 21, "ok": true, "status": "expected", "tags": [], "tests": [{"projectName": "chromium", "results": [{"retry": 0, "status": "passed"}], "status": "expected"}], "title": "golden-path :: case 04"},
+        {"column": 1, "file": "e2e/golden-path.spec.ts", "id": "000000000000000000000000a5a50005", "line": 27, "ok": true, "status": "expected", "tags": [], "tests": [{"projectName": "chromium", "results": [{"retry": 0, "status": "passed"}], "status": "expected"}], "title": "golden-path :: case 05"}
+      ]
+    },
+    {
+      "title": "e2e/unicode.spec.ts",
+      "file": "e2e/unicode.spec.ts",
+      "specs": [
+        {"column": 1, "file": "e2e/unicode.spec.ts", "id": "000000000000000000000000a5a50006", "line": 3, "ok": true, "status": "expected", "tags": [], "tests": [{"projectName": "chromium", "results": [{"retry": 0, "status": "passed"}], "status": "expected"}], "title": "unicode :: case 01"},
+        {"column": 1, "file": "e2e/unicode.spec.ts", "id": "000000000000000000000000a5a50007", "line": 9, "ok": true, "status": "expected", "tags": [], "tests": [{"projectName": "chromium", "results": [{"retry": 0, "status": "passed"}], "status": "expected"}], "title": "unicode :: case 02"},
+        {"column": 1, "file": "e2e/unicode.spec.ts", "id": "000000000000000000000000a5a50008", "line": 15, "ok": true, "status": "expected", "tags": [], "tests": [{"projectName": "chromium", "results": [{"retry": 0, "status": "passed"}], "status": "expected"}], "title": "unicode :: case 03"},
+        {"column": 1, "file": "e2e/unicode.spec.ts", "id": "000000000000000000000000a5a50009", "line": 21, "ok": true, "status": "expected", "tags": [], "tests": [{"projectName": "chromium", "results": [{"retry": 0, "status": "passed"}], "status": "expected"}], "title": "unicode :: case 04"},
+        {"column": 1, "file": "e2e/unicode.spec.ts", "id": "000000000000000000000000a5a5000a", "line": 27, "ok": true, "status": "expected", "tags": [], "tests": [{"projectName": "chromium", "results": [{"retry": 0, "status": "passed"}], "status": "expected"}], "title": "unicode :: case 05"}
+      ]
+    },
+    {
+      "title": "e2e/segmentation.spec.ts",
+      "file": "e2e/segmentation.spec.ts",
+      "specs": [
+        {"column": 1, "file": "e2e/segmentation.spec.ts", "id": "000000000000000000000000a5a5000b", "line": 3, "ok": true, "status": "expected", "tags": [], "tests": [{"projectName": "chromium", "results": [{"retry": 0, "status": "passed"}], "status": "expected"}], "title": "segmentation :: case 01"},
+        {"column": 1, "file": "e2e/segmentation.spec.ts", "id": "000000000000000000000000a5a5000c", "line": 9, "ok": true, "status": "expected", "tags": [], "tests": [{"projectName": "chromium", "results": [{"retry": 0, "status": "passed"}], "status": "expected"}], "title": "segmentation :: case 02"},
+        {"column": 1, "file": "e2e/segmentation.spec.ts", "id": "000000000000000000000000a5a5000d", "line": 15, "ok": true, "status": "expected", "tags": [], "tests": [{"projectName": "chromium", "results": [{"retry": 0, "status": "passed"}], "status": "expected"}], "title": "segmentation :: case 03"},
+        {"column": 1, "file": "e2e/segmentation.spec.ts", "id": "000000000000000000000000a5a5000e", "line": 21, "ok": true, "status": "expected", "tags": [], "tests": [{"projectName": "chromium", "results": [{"retry": 0, "status": "passed"}], "status": "expected"}], "title": "segmentation :: case 04"},
+        {"column": 1, "file": "e2e/segmentation.spec.ts", "id": "000000000000000000000000a5a5000f", "line": 27, "ok": true, "status": "expected", "tags": [], "tests": [{"projectName": "chromium", "results": [{"retry": 0, "status": "passed"}], "status": "expected"}], "title": "segmentation :: case 05"}
+      ]
+    },
+    {
+      "title": "e2e/token-segmentation.spec.ts",
+      "file": "e2e/token-segmentation.spec.ts",
+      "specs": [
+        {"column": 1, "file": "e2e/token-segmentation.spec.ts", "id": "000000000000000000000000a5a50010", "line": 3, "ok": true, "status": "expected", "tags": [], "tests": [{"projectName": "chromium", "results": [{"retry": 0, "status": "passed"}], "status": "expected"}], "title": "token-segmentation :: case 01"},
+        {"column": 1, "file": "e2e/token-segmentation.spec.ts", "id": "000000000000000000000000a5a50011", "line": 9, "ok": true, "status": "expected", "tags": [], "tests": [{"projectName": "chromium", "results": [{"retry": 0, "status": "passed"}], "status": "expected"}], "title": "token-segmentation :: case 02"},
+        {"column": 1, "file": "e2e/token-segmentation.spec.ts", "id": "000000000000000000000000a5a50012", "line": 15, "ok": true, "status": "expected", "tags": [], "tests": [{"projectName": "chromium", "results": [{"retry": 0, "status": "passed"}], "status": "expected"}], "title": "token-segmentation :: case 03"},
+        {"column": 1, "file": "e2e/token-segmentation.spec.ts", "id": "000000000000000000000000a5a50013", "line": 21, "ok": true, "status": "expected", "tags": [], "tests": [{"projectName": "chromium", "results": [{"retry": 0, "status": "passed"}], "status": "expected"}], "title": "token-segmentation :: case 04"},
+        {"column": 1, "file": "e2e/token-segmentation.spec.ts", "id": "000000000000000000000000a5a50014", "line": 27, "ok": true, "status": "expected", "tags": [], "tests": [{"projectName": "chromium", "results": [{"retry": 0, "status": "passed"}], "status": "expected"}], "title": "token-segmentation :: case 05"}
+      ]
+    },
+    {
+      "title": "e2e/lemma-annotation.spec.ts",
+      "file": "e2e/lemma-annotation.spec.ts",
+      "specs": [
+        {"column": 1, "file": "e2e/lemma-annotation.spec.ts", "id": "000000000000000000000000a5a50015", "line": 3, "ok": true, "status": "expected", "tags": [], "tests": [{"projectName": "chromium", "results": [{"retry": 0, "status": "passed"}], "status": "expected"}], "title": "lemma-annotation :: case 01"},
+        {"column": 1, "file": "e2e/lemma-annotation.spec.ts", "id": "000000000000000000000000a5a50016", "line": 9, "ok": true, "status": "expected", "tags": [], "tests": [{"projectName": "chromium", "results": [{"retry": 0, "status": "passed"}], "status": "expected"}], "title": "lemma-annotation :: case 02"},
+        {"column": 1, "file": "e2e/lemma-annotation.spec.ts", "id": "000000000000000000000000a5a50017", "line": 15, "ok": true, "status": "expected", "tags": [], "tests": [{"projectName": "chromium", "results": [{"retry": 0, "status": "passed"}], "status": "expected"}], "title": "lemma-annotation :: case 03"},
+        {"column": 1, "file": "e2e/lemma-annotation.spec.ts", "id": "000000000000000000000000a5a50018", "line": 21, "ok": true, "status": "expected", "tags": [], "tests": [{"projectName": "chromium", "results": [{"retry": 0, "status": "passed"}], "status": "expected"}], "title": "lemma-annotation :: case 04"},
+        {"column": 1, "file": "e2e/lemma-annotation.spec.ts", "id": "000000000000000000000000a5a50019", "line": 27, "ok": true, "status": "expected", "tags": [], "tests": [{"projectName": "chromium", "results": [{"retry": 0, "status": "passed"}], "status": "expected"}], "title": "lemma-annotation :: case 05"}
+      ]
+    },
+    {
+      "title": "e2e/pos-annotation.spec.ts",
+      "file": "e2e/pos-annotation.spec.ts",
+      "specs": [
+        {"column": 1, "file": "e2e/pos-annotation.spec.ts", "id": "000000000000000000000000a5a5001a", "line": 3, "ok": true, "status": "expected", "tags": [], "tests": [{"projectName": "chromium", "results": [{"retry": 0, "status": "passed"}], "status": "expected"}], "title": "pos-annotation :: case 01"},
+        {"column": 1, "file": "e2e/pos-annotation.spec.ts", "id": "000000000000000000000000a5a5001b", "line": 9, "ok": true, "status": "expected", "tags": [], "tests": [{"projectName": "chromium", "results": [{"retry": 0, "status": "passed"}], "status": "expected"}], "title": "pos-annotation :: case 02"},
+        {"column": 1, "file": "e2e/pos-annotation.spec.ts", "id": "000000000000000000000000a5a5001c", "line": 15, "ok": true, "status": "expected", "tags": [], "tests": [{"projectName": "chromium", "results": [{"retry": 0, "status": "passed"}], "status": "expected"}], "title": "pos-annotation :: case 03"},
+        {"column": 1, "file": "e2e/pos-annotation.spec.ts", "id": "000000000000000000000000a5a5001d", "line": 21, "ok": true, "status": "expected", "tags": [], "tests": [{"projectName": "chromium", "results": [{"retry": 0, "status": "passed"}], "status": "expected"}], "title": "pos-annotation :: case 04"},
+        {"column": 1, "file": "e2e/pos-annotation.spec.ts", "id": "000000000000000000000000a5a5001e", "line": 27, "ok": true, "status": "expected", "tags": [], "tests": [{"projectName": "chromium", "results": [{"retry": 0, "status": "passed"}], "status": "expected"}], "title": "pos-annotation :: case 05"}
+      ]
+    },
+    {
+      "title": "e2e/workbench-information-architecture.spec.ts",
+      "file": "e2e/workbench-information-architecture.spec.ts",
+      "specs": [
+        {"column": 1, "file": "e2e/workbench-information-architecture.spec.ts", "id": "000000000000000000000000a5a5001f", "line": 3, "ok": true, "status": "expected", "tags": [], "tests": [{"projectName": "chromium", "results": [{"retry": 0, "status": "passed"}], "status": "expected"}], "title": "workbench-information-architecture :: case 01"},
+        {"column": 1, "file": "e2e/workbench-information-architecture.spec.ts", "id": "000000000000000000000000a5a50020", "line": 9, "ok": true, "status": "expected", "tags": [], "tests": [{"projectName": "chromium", "results": [{"retry": 0, "status": "passed"}], "status": "expected"}], "title": "workbench-information-architecture :: case 02"},
+        {"column": 1, "file": "e2e/workbench-information-architecture.spec.ts", "id": "000000000000000000000000a5a50021", "line": 15, "ok": true, "status": "expected", "tags": [], "tests": [{"projectName": "chromium", "results": [{"retry": 0, "status": "passed"}], "status": "expected"}], "title": "workbench-information-architecture :: case 03"},
+        {"column": 1, "file": "e2e/workbench-information-architecture.spec.ts", "id": "000000000000000000000000a5a50022", "line": 21, "ok": true, "status": "expected", "tags": [], "tests": [{"projectName": "chromium", "results": [{"retry": 0, "status": "passed"}], "status": "expected"}], "title": "workbench-information-architecture :: case 04"}
+      ]
+    }
+  ],
+  "stats": {"duration": 18432.517, "expected": 34, "flaky": 0, "skipped": 0, "unexpected": 0}
+}

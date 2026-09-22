@@ -1,2 +1,5 @@
 /candidate/
 /proof-artifacts/
+/.m8-host-state/
+__pycache__/
+*.pyc

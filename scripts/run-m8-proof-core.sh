@@ -4,10 +4,21 @@
 # M8 proof-source preparation. The Product pins below target the exact reviewed
 # M8 candidate. This file MUST NOT be executed without separate Human approval
 # of the exact proof commit, an exact live provider binding, and a fresh M8
-# one-shot run authorization through an approved adapter.
+# one-shot run authorization through the formal wrapper
+# (scripts/run-m8-proof.sh).
+#
+# RC ownership: this core MUST NOT write core-exit-code.txt. That file is the
+# process RC of this script as observed by its parent adapter, and is written
+# only by scripts/run-m8-proof-alibaba-ecs.sh immediately after this child
+# returns. The formal wrapper then captures the adapter's RC as
+# formal-execution-rc.txt.
 set -Eeuo pipefail
 
-readonly PROOF_ROOT="$(git rev-parse --show-toplevel)"
+M8_CORE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/lib" && pwd)"
+# shellcheck source=lib/m8-manifest.sh
+source "$M8_CORE_LIB_DIR/m8-manifest.sh"
+
+readonly PROOF_ROOT="${M8_PROOF_ROOT:-$(git rev-parse --show-toplevel)}"
 readonly EVIDENCE="${M8_PROOF_EVIDENCE_DIR:-$PROOF_ROOT/proof-artifacts}"
 readonly CANDIDATE="$PROOF_ROOT/candidate"
 
@@ -28,6 +39,37 @@ readonly EXPECTED_PLAYWRIGHT_PASSED='34'
 
 readonly POSTGRES_CONTAINER='linguagraph-m8-proof-postgres'
 readonly DB_URL='postgresql+psycopg://postgres:postgres@127.0.0.1:5432/postgres'
+
+# Frozen seven-spec Playwright release surface. These paths are relative to the
+# reporter rootDir ($CANDIDATE/apps/web) and are exactly the JSON reporter's
+# suite `file` namespace.
+readonly -a PLAYWRIGHT_SPECS=(
+  'e2e/golden-path.spec.ts'
+  'e2e/unicode.spec.ts'
+  'e2e/segmentation.spec.ts'
+  'e2e/token-segmentation.spec.ts'
+  'e2e/lemma-annotation.spec.ts'
+  'e2e/pos-annotation.spec.ts'
+  'e2e/workbench-information-architecture.spec.ts'
+)
+
+# Emit the frozen static binding for the formal wrapper. This mode must not
+# create, read or mutate any evidence or checkout state.
+emit_static_binding() {
+  printf 'candidate_sha=%s\n' "$APP_SHA"
+  printf 'candidate_tree=%s\n' "$APP_TREE"
+  printf 'candidate_parent=%s\n' "$APP_PARENT"
+  printf 'frozen_main=%s\n' "$MAIN_SHA"
+  printf 'alembic_head=%s\n' "$ALEMBIC_HEAD"
+  printf 'expected_pytest_passed=%s\n' "$EXPECTED_PYTEST_PASSED"
+  printf 'expected_vitest_passed=%s\n' "$EXPECTED_VITEST_PASSED"
+  printf 'expected_playwright_passed=%s\n' "$EXPECTED_PLAYWRIGHT_PASSED"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" && "${1:-}" == '--emit-static-binding' ]]; then
+  emit_static_binding
+  exit 0
+fi
 
 mkdir -p "$EVIDENCE"
 completed=0
@@ -87,12 +129,10 @@ finish() {
   else
     printf 'FAIL exit=%s cleanup=%s\n' "$exit_code" "$cleanup_code" > "$EVIDENCE/outcome.txt"
   fi
-  (
-    cd "$EVIDENCE"
-    find . -type f ! -name artifact-manifest.sha256 -print0 |
-      sort -z |
-      xargs -0 -r sha256sum > artifact-manifest.sha256
-  ) || exit_code=1
+  # The core owns its own evidence manifest. The formal wrapper re-derives the
+  # same deterministic manifest at seal time before the canonical archive is
+  # created; the algorithm is shared through scripts/lib/m8-manifest.sh.
+  m8_manifest_generate "$EVIDENCE" || exit_code=1
   exit "$exit_code"
 }
 trap finish EXIT
@@ -130,9 +170,17 @@ guard_approved_proof() {
   [[ -z "$(git -C "$PROOF_ROOT" status --porcelain=v1 --untracked-files=all)" ]] || die 'Dirty proof source'
 }
 
+# core-exit-code.txt is the core process RC observed by the adapter. The core
+# never writes it, and refuses to run if a stale one already exists.
+guard_core_rc_ownership() {
+  [[ ! -e "$EVIDENCE/core-exit-code.txt" ]] ||
+    die 'core-exit-code.txt exists; it belongs to the parent adapter and must never be written by the core'
+}
+
 guard_core() {
   guard_candidate_config
   guard_approved_proof
+  guard_core_rc_ownership
   probe_docker >/dev/null
   record proof_sha "$APPROVED_PROOF_SHA"
   record proof_tree "$(git -C "$PROOF_ROOT" rev-parse HEAD^{tree})"
@@ -349,14 +397,50 @@ frontend() {
   npm run build
 }
 
+# Frozen Playwright runtime evidence (M8-HSDR-F02 / R2B section 10).
+#
+# Exactly one --reporter option (list,json). CI=1 and an explicit JSON output
+# file are exported. The exact JSON report is then parsed with Python stdlib and
+# must prove: every project retries == 0, project names == {chromium},
+# expected == 34, unexpected == 0, flaky == 0, skipped == 0, and that the set of
+# spec files in the report equals the seven frozen specs exactly.
+#
+# Namespace: the reporter runs with rootDir = $CANDIDATE/apps/web, so the JSON
+# reporter's suite `file` values are relative to that rootDir and are exactly
+# `e2e/<name>.spec.ts`. The expected values passed to the verifier therefore use
+# the SAME rootDir-relative namespace; `apps/web/e2e/...` is never expected
+# inside the JSON report. Only then is playwright-effective-retries.txt written,
+# with exact content PLAYWRIGHT_EFFECTIVE_RETRIES=0. Either the raw log count
+# check or the JSON check failing is fatal; the JSON check is the authority.
 browser_e2e() {
   activate_runtimes
-  export DATABASE_URL="$DB_URL" TEST_DATABASE_URL="$DB_URL" CI=1
+  export DATABASE_URL="$DB_URL" TEST_DATABASE_URL="$DB_URL"
+  export CI=1
+  export PLAYWRIGHT_JSON_OUTPUT_FILE="$EVIDENCE/playwright-json-report.json"
   cd "$CANDIDATE/apps/web"
   npx playwright install --with-deps chromium
-  npx playwright test     e2e/golden-path.spec.ts e2e/unicode.spec.ts     e2e/segmentation.spec.ts e2e/token-segmentation.spec.ts     e2e/lemma-annotation.spec.ts e2e/pos-annotation.spec.ts     e2e/workbench-information-architecture.spec.ts     --retries=0 2>&1 | tee "$EVIDENCE/playwright-raw.log"
-  grep -Eq "${EXPECTED_PLAYWRIGHT_PASSED} passed" "$EVIDENCE/playwright-raw.log" || die "Expected all ${EXPECTED_PLAYWRIGHT_PASSED} Playwright paths"
-  ! grep -Eiq '[1-9][0-9]* (skipped|flaky|failed)' "$EVIDENCE/playwright-raw.log" || die 'Playwright skipped/flaky/failed'
+  rm -f "$EVIDENCE/playwright-json-report.json" "$EVIDENCE/playwright-effective-retries.txt"
+  npx playwright test \
+    "${PLAYWRIGHT_SPECS[@]}" \
+    --retries=0 \
+    --fail-on-flaky-tests \
+    --reporter=list,json 2>&1 | tee "$EVIDENCE/playwright-raw.log"
+  ! grep -Eiq '[1-9][0-9]* (skipped|flaky|failed)' "$EVIDENCE/playwright-raw.log" ||
+    die 'Playwright raw log reports skipped/flaky/failed paths'
+  local -a spec_args=()
+  local spec
+  for spec in "${PLAYWRIGHT_SPECS[@]}"; do
+    # PLAYWRIGHT_SPECS are already reporter-rootDir-relative; do not re-prefix.
+    spec_args+=(--spec "$spec")
+  done
+  "$PROOF_ROOT/scripts/verify-m8-playwright-json.py" \
+    --report "$EVIDENCE/playwright-json-report.json" \
+    --out "$EVIDENCE/playwright-effective-retries.txt" \
+    --expected-tests "$EXPECTED_PLAYWRIGHT_PASSED" \
+    "${spec_args[@]}" | tee "$EVIDENCE/playwright-json-check.log"
+  grep -Eq "${EXPECTED_PLAYWRIGHT_PASSED} passed" "$EVIDENCE/playwright-raw.log" ||
+    printf 'NOTE: raw-log count guard is secondary; JSON report is the authority\n' |
+      tee -a "$EVIDENCE/playwright-json-check.log"
 }
 
 hash_manifest() {

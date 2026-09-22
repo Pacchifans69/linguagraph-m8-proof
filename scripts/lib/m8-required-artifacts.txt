@@ -1,0 +1,119 @@
+# Required execution artifacts for an M8-HSDR-F02 formal closure (PHASE A).
+#
+# The contract is an EXPLICIT canonical relative-path set. Paths are relative to
+# the formal evidence directory and are compared as a set:
+#
+#   actual regular files (minus artifact-manifest.sha256) == this exact set
+#
+# Blank lines and lines beginning with '#' are ignored deterministically. Every
+# other line must be a canonical relative path: absolute paths, '.', '..', any
+# '..' traversal component, empty components, './' prefixes, backslash
+# separators and shell-style globs are all rejected, as are duplicate entries.
+# scripts/verify-m8-artifact-completeness.py owns that validation.
+#
+# These are artifacts of the EXECUTION phase only. Seal-phase outputs
+# (artifact-manifest.sha256, the canonical archive, package-index.json) and the
+# commit-phase closure-receipt.json are deliberately excluded: the manifest must
+# not contain itself, and the archive/index/receipt are generated outside the
+# evidence root after the execution phase has been validated.
+
+# core semantic evidence
+outcome.txt
+provenance.txt
+stages.txt
+runtime.txt
+candidate-file-scope.txt
+candidate-files.txt
+expected-candidate-files.txt
+candidate-final-status.txt
+deps-pre.sha256
+deps-post.sha256
+disposable-db-residual.txt
+docker-owned-marker
+pytest-junit.xml
+pytest-raw.log
+m7-concurrency-junit-check.log
+m8-routing-matrix-raw.log
+m8-routing-matrix-check.log
+vitest-raw.log
+playwright-raw.log
+
+# one evidence log per semantic stage() invocation
+guard_core.log
+guard_remote.log
+fetch_candidate.log
+deps_pre.log
+install_runtimes.log
+backend.log
+frontend.log
+playwright.log
+integrity.log
+
+# frozen Playwright runtime evidence (spec section 10)
+playwright-json-report.json
+playwright-json-check.log
+playwright-effective-retries.txt
+
+# RC capture and formal invocation context (spec sections 2 and 9)
+core-exit-code.txt
+adapter-exit-code.txt
+formal-execution-rc.txt
+adapter-raw.log
+adapter-provenance.txt
+adapter-oss.log
+claim-adapter-readback.json
+wrapper-provenance.txt
+formal-invocation-context.txt
+issued.json
+claim.json
+oss-preclaim.log
+
+# OSS guards
+oss-versioning-guard.txt
+ossutil-capability.txt
+
+# pre-claim read-only provider identity capture
+provider-identity/primary/provider-identity-result.txt
+provider-identity/primary/instance-id.txt
+provider-identity/primary/region-id.txt
+provider-identity/primary/zone-id.txt
+provider-identity/primary/instance-type.txt
+provider-identity/primary/image-id.txt
+provider-identity/primary/instance-identity-document.json
+provider-identity/primary/instance-identity-pkcs7.txt
+provider-identity/primary/instance-identity-document.sha256
+provider-identity/primary/instance-identity-pkcs7.sha256
+provider-identity/primary/instance-name.txt
+provider-identity/primary/hostname.txt
+provider-identity/primary/serial-number.txt
+provider-identity/primary/vpc-id.txt
+provider-identity/primary/vswitch-id.txt
+provider-identity/primary/private-ipv4.txt
+provider-identity/primary/public-ipv4.txt
+provider-identity/primary/eipv4.txt
+provider-identity/primary/primary-mac.txt
+provider-identity/primary/primary-eni.txt
+provider-identity/primary/primary-eni-private-ipv4.txt
+
+# post-claim read-only provider identity capture (defence in depth)
+provider-identity/reexec/provider-identity-result.txt
+provider-identity/reexec/instance-id.txt
+provider-identity/reexec/region-id.txt
+provider-identity/reexec/zone-id.txt
+provider-identity/reexec/instance-type.txt
+provider-identity/reexec/image-id.txt
+provider-identity/reexec/instance-identity-document.json
+provider-identity/reexec/instance-identity-pkcs7.txt
+provider-identity/reexec/instance-identity-document.sha256
+provider-identity/reexec/instance-identity-pkcs7.sha256
+provider-identity/reexec/instance-name.txt
+provider-identity/reexec/hostname.txt
+provider-identity/reexec/serial-number.txt
+provider-identity/reexec/vpc-id.txt
+provider-identity/reexec/vswitch-id.txt
+provider-identity/reexec/private-ipv4.txt
+provider-identity/reexec/public-ipv4.txt
+provider-identity/reexec/eipv4.txt
+provider-identity/reexec/primary-mac.txt
+provider-identity/reexec/primary-eni.txt
+provider-identity/reexec/primary-eni-private-ipv4.txt

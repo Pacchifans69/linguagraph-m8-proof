@@ -1,369 +1,271 @@
 #!/usr/bin/env bash
-# M8-EXI-01 Alibaba ECS thin adapter.
+# LinguaGraph M8 formal execution adapter (Alibaba ECS).
 #
-# Provider-bound M8 proof source. Product pins and one-shot/replay protections
-# remain frozen. The Alibaba provider identity below was established by the
-# read-only M8-EXI-01 preflight on 2026-09-20T08:11:52Z. Formal execution still
-# requires Human approval of this exact proof commit and a fresh one-shot M8
-# run authorization.
+# This is NOT an independent formal runner. It has no formal commit authority.
+# It executes the provider-neutral semantic core ONLY when it has been invoked
+# by the formal wrapper scripts/run-m8-proof.sh, proven by:
+#
+#   1. the wrapper-issued formal invocation context file inside the fixed
+#      evidence directory, containing the in-process invocation nonce digest;
+#   2. the durable single-use claim at
+#      authorizations/<authorization_sha256>/claim.json, read back from OSS,
+#      whose bytes hash to the claim digest bound in the context;
+#   3. the claim naming exactly this authorization and this authorized executor;
+#   4. a second read-only provider identity verification whose observed tuple
+#      matches both the reviewed immutable identity and the claim.
+#
+# Without that context it refuses to consume any M8 formal authorization, will
+# not invoke the semantic core, and creates no claim, archive, package index or
+# closure receipt. Such an invocation is reported as NONFORMAL / NOT_APPLICABLE.
+#
+# RC ownership:
+#   * core-exit-code.txt   = process RC of run-m8-proof-core.sh, captured here
+#                            immediately after the child returns. The core never
+#                            writes it.
+#   * adapter-exit-code.txt = this adapter's final self-declared RC, written by
+#                            the EXIT trap after all adapter work.
+#
+# Never run this without separate Human approval of the exact proof commit and a
+# fresh single-use authorization presented to the wrapper.
 set -Eeuo pipefail
 
-readonly PROOF_ROOT="$(git rev-parse --show-toplevel)"
-readonly CORE="$PROOF_ROOT/scripts/run-m8-proof-core.sh"
+M8_ADAPTER_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/lib" && pwd)"
+# shellcheck source=lib/m8-synthetic-seams.sh
+source "$M8_ADAPTER_LIB_DIR/m8-synthetic-seams.sh"
+# shellcheck source=lib/m8-provider-identity.sh
+source "$M8_ADAPTER_LIB_DIR/m8-provider-identity.sh"
+# shellcheck source=lib/m8-oss.sh
+source "$M8_ADAPTER_LIB_DIR/m8-oss.sh"
+# shellcheck source=lib/m8-manifest.sh
+source "$M8_ADAPTER_LIB_DIR/m8-manifest.sh"
 
-readonly INHERITED_EVIDENCE_DIR="${M8_PROOF_EVIDENCE_DIR:-}"
-readonly FIXED_EVIDENCE="$PROOF_ROOT/proof-artifacts"
-readonly EVIDENCE="$FIXED_EVIDENCE"
-export M8_PROOF_EVIDENCE_DIR="$EVIDENCE"
+M8_ADAPTER_MODE='NONFORMAL'
+ADAPTER_CORE_INVOKED=0
+CORE_RC=''
+CLAIM_SHA256_LOCAL=''
 
-readonly PROOF_ORIGIN_URL='https://github.com/Pacchifans69/linguagraph-m8-proof.git'
-
-readonly INHERITED_HOME="${HOME:-}"
-ACCOUNT_HOME=''
-if ! ACCOUNT_HOME="$(getent passwd "$(id -u)" | awk -F: 'NR == 1 { print $6 }')"; then
-  printf 'FAIL: unable to resolve account home from passwd database\n' >&2
+nonformal_refuse() {
+  printf 'M8_ADAPTER_MODE=NONFORMAL\n'
+  printf 'M8_FORMAL_STATUS=NOT_APPLICABLE\n'
+  printf 'M8_ADAPTER_REFUSAL=%s\n' "$*"
+  printf 'adapter: refusing to consume any M8 formal authorization, refusing to invoke the semantic core, and creating no claim/archive/index/receipt\n' >&2
   exit 1
-fi
-[[ -n "$ACCOUNT_HOME" ]] || { printf 'FAIL: resolved account home is empty\n' >&2; exit 1; }
-readonly ACCOUNT_HOME
-readonly INHERITED_HOST_STATE="${M8_PROOF_HOST_STATE:-}"
-readonly FIXED_HOST_STATE="$ACCOUNT_HOME/.local/state/linguagraph-m8-proof"
-readonly HOST_STATE="$FIXED_HOST_STATE"
-readonly SPENT_DIR="$HOST_STATE/spent"
-readonly ARCHIVE_DIR="$HOST_STATE/artifacts"
-
-readonly IMDS_BASE='http://100.100.100.200/latest'
-readonly IMDS_TOKEN_URL="$IMDS_BASE/api/token"
-readonly IMDS_TTL='21600'
-
-# Exact fresh provider binding established by the separately authorized M8
-# successor P3A/P3B/P3C provider preflight. Keep this fail-closed: do not replace
-# these constants with wildcards or runtime-supplied arbitrary host identity.
-readonly EXPECTED_INSTANCE_ID='i-j6c9854oyawy89fcdxy2'
-readonly EXPECTED_REGION_ID='cn-hongkong'
-readonly EXPECTED_ZONE_ID='cn-hongkong-d'
-readonly EXPECTED_INSTANCE_TYPE='ecs.g9i.xlarge'
-readonly EXPECTED_IMAGE_ID='ubuntu_24_04_x64_20G_alibase_20260916.vhd'
-readonly EXPECTED_IDENTITY_DOCUMENT_SHA256='60f62ad9f4c10aab718bdc6dfdf0c57e1e4ced293908417009df8e4b7dbdaa1d'
-readonly EXPECTED_IDENTITY_PKCS7_SHA256='89185b286e03b344a5ca7e2f3a242baf4b454419dab0cd83ec3426981860d211'
-
-readonly PROVIDER_BINDING_READY='YES'
-readonly RUN_AUTH_NAMESPACE_DESCRIPTION='M8-EXI-01-RUN-<approved-proof-sha-prefix>-<nonce>'
-
-IMDS_TOKEN=''
-AUTHORIZATION_SHA256=''
-core_rc=0
+}
 
 die() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 expect() { [[ "$1" == "$2" ]] || die "Mismatch: $3 (expected $2; got $1)"; }
-record() { printf '%s=%s\n' "$1" "$2" >> "$EVIDENCE/provenance.txt"; }
-
-write_manifest() {
-  local tmp="$EVIDENCE/.artifact-manifest.sha256.tmp"
-  rm -f "$tmp"
-  if (
-    cd "$EVIDENCE"
-    find . -type f       ! -name artifact-manifest.sha256       ! -name .artifact-manifest.sha256.tmp       -print0 | sort -z | xargs -0 -r sha256sum
-  ) > "$tmp"; then
-    mv -f "$tmp" "$EVIDENCE/artifact-manifest.sha256"
-  else
-    rm -f "$tmp"
-    return 1
-  fi
+record() {
+  [[ -n "$EVIDENCE" && -d "$EVIDENCE" ]] || return 0
+  printf '%s=%s\n' "$1" "$2" >> "$EVIDENCE/adapter-provenance.txt"
 }
 
-build_archive() {
-  local archive_name=$1 archive=$2 sidecar=''
-  sidecar="${archive}.sha256"
+# Formal eligibility guard. A direct production execution of this adapter must
+# never be reachable through an offline synthetic seam, so this fails closed
+# before the formal-context guards, before any provider read and before any
+# host-state mutation: a redirected metadata client/endpoint or a stub object
+# store can never impersonate the formal provider identity.
+m8_reject_synthetic_overrides ||
+  die 'offline synthetic override is set; refusing to execute the formal adapter'
 
-  # Reserve both canonical output paths without clobbering. This makes a
-  # repeated authorization attempt incapable of overwriting the first archive.
-  if ! (set -o noclobber; : > "$archive") 2>/dev/null; then
-    return 2
-  fi
-  if ! (set -o noclobber; : > "$sidecar") 2>/dev/null; then
-    rm -f "$archive"
-    return 2
-  fi
+# Resolve the proof root without aborting on a non-git working directory.
+if [[ -n "${M8_PROOF_ROOT:-}" ]]; then
+  PROOF_ROOT="$M8_PROOF_ROOT"
+else
+  PROOF_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || printf '')"
+fi
+readonly PROOF_ROOT
+[[ -n "$PROOF_ROOT" ]] || nonformal_refuse 'the proof repository root could not be resolved'
 
-  if ! tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner        -C "$PROOF_ROOT" -cf - proof-artifacts | gzip -n > "$archive"; then
-    rm -f "$archive" "$sidecar"
-    return 1
-  fi
-  if ! (cd "$ARCHIVE_DIR" && sha256sum "$archive_name" > "$archive_name.sha256"); then
-    rm -f "$archive" "$sidecar"
-    return 1
-  fi
+readonly CORE="$PROOF_ROOT/scripts/run-m8-proof-core.sh"
+readonly EVIDENCE="$PROOF_ROOT/proof-artifacts"
+
+# ---------------------------------------------------------------------------
+# Formal-context guards. Anything missing is NONFORMAL / NOT_APPLICABLE.
+# ---------------------------------------------------------------------------
+readonly CONTEXT_FILE="$EVIDENCE/formal-invocation-context.txt"
+
+[[ -n "${M8_FORMAL_WRAPPER_CONTEXT:-}" ]] ||
+  nonformal_refuse 'M8_FORMAL_WRAPPER_CONTEXT is absent; only scripts/run-m8-proof.sh may invoke this adapter formally'
+[[ "$M8_FORMAL_WRAPPER_CONTEXT" == "$CONTEXT_FILE" ]] ||
+  nonformal_refuse "M8_FORMAL_WRAPPER_CONTEXT must be exactly $CONTEXT_FILE"
+[[ -f "$CONTEXT_FILE" ]] ||
+  nonformal_refuse "formal invocation context is missing: $CONTEXT_FILE"
+[[ -d "$EVIDENCE" ]] ||
+  nonformal_refuse "formal evidence directory is missing: $EVIDENCE"
+[[ -f "$CORE" ]] || nonformal_refuse "semantic core is missing: $CORE"
+
+# The wrapper is invoked with an explicit fixed evidence path; a redirected path
+# is refused so that authority cannot be relocated.
+if [[ -n "${M8_PROOF_EVIDENCE_DIR:-}" && "${M8_PROOF_EVIDENCE_DIR}" != "$EVIDENCE" ]]; then
+  nonformal_refuse "M8_PROOF_EVIDENCE_DIR must be unset or exactly $EVIDENCE"
+fi
+
+# Spoofed hosted identity is refused before anything else.
+for v in CIRCLE_PROJECT_USERNAME CIRCLE_PROJECT_REPONAME CIRCLE_BRANCH \
+  CIRCLE_SHA1 CIRCLE_WORKFLOW_ID CIRCLE_BUILD_NUM; do
+  [[ -z "${!v:-}" ]] ||
+    nonformal_refuse "CircleCI identity variable $v is set; Alibaba execution must not be obtained by spoofing CircleCI"
+done
+
+context_get() {
+  local key=$1
+  sed -n "s/^${key}=//p" "$CONTEXT_FILE" | head -n1
 }
 
-finalize() {
-  local exit_code=$? packaging_failed=0 archive_name='' archive='' first_line='' archive_rc=0
+context_validate() {
+  local schema authorization_kind authorization_sha semantic_auth_sha proof_sha
+  local proof_tree authorized_executor_id executor_id claim_object claim_sha
+  local run_prefix nonce_sha formal_entrypoint
+
+  schema="$(context_get schema)"
+  formal_entrypoint="$(context_get formal_entrypoint)"
+  authorization_kind="$(context_get authorization_kind)"
+  authorization_sha="$(context_get authorization_sha256)"
+  semantic_auth_sha="$(context_get semantic_auth_sha256)"
+  proof_sha="$(context_get proof_sha)"
+  proof_tree="$(context_get proof_tree)"
+  authorized_executor_id="$(context_get authorized_executor_id)"
+  executor_id="$(context_get executor_id)"
+  claim_object="$(context_get claim_object)"
+  claim_sha="$(context_get claim_sha256)"
+  run_prefix="$(context_get run_prefix)"
+  nonce_sha="$(context_get invocation_nonce_sha256)"
+
+  expect "$schema" 'linguagraph-m8-formal-invocation-context/v1' context_schema
+  expect "$formal_entrypoint" 'scripts/run-m8-proof.sh' context_formal_entrypoint
+  [[ "$authorization_kind" == 'SEMANTIC' || "$authorization_kind" == 'DURABILITY_RETRY' ]] ||
+    die "context authorization_kind is invalid: $authorization_kind"
+  [[ "$authorization_sha" =~ ^[0-9a-f]{64}$ ]] || die 'context authorization_sha256 is not a SHA-256'
+  [[ "$semantic_auth_sha" =~ ^[0-9a-f]{64}$ ]] || die 'context semantic_auth_sha256 is not a SHA-256'
+  [[ "$proof_sha" =~ ^[0-9a-f]{40}$ ]] || die 'context proof_sha is not a commit SHA'
+  [[ "$proof_tree" =~ ^[0-9a-f]{40}$ ]] || die 'context proof_tree is not a tree SHA'
+  [[ "$claim_sha" =~ ^[0-9a-f]{64}$ ]] || die 'context claim_sha256 is not a SHA-256'
+  [[ "$nonce_sha" =~ ^[0-9a-f]{64}$ ]] || die 'context invocation_nonce_sha256 is not a SHA-256'
+  expect "$authorized_executor_id" "$(m8_provider_identity_executor_id)" context_authorized_executor_id
+  expect "$executor_id" "$(m8_provider_identity_executor_id)" context_executor_id
+  expect "$claim_object" "authorizations/$authorization_sha/claim.json" context_claim_object
+  expect "$run_prefix" "runs/$proof_sha/$semantic_auth_sha" context_run_prefix
+
+  # The authorization presented to the wrapper must be the one in the context.
+  # The presented value is the exact Human-issued TOKEN, so it is hashed here and
+  # the DIGEST is compared to the context's authorization_sha256; the token is
+  # never echoed and never enters evidence.
+  local presented='' presented_sha=''
+  if [[ -n "${M8_PROOF_RUN_AUTHORIZATION:-}" && -n "${M8_PROOF_RETRY_AUTHORIZATION:-}" ]]; then
+    die 'present exactly one of M8_PROOF_RUN_AUTHORIZATION or M8_PROOF_RETRY_AUTHORIZATION'
+  fi
+  presented="${M8_PROOF_RUN_AUTHORIZATION:-${M8_PROOF_RETRY_AUTHORIZATION:-}}"
+  [[ -n "$presented" ]] ||
+    die 'no authorization token was presented to the adapter'
+  presented_sha="$(printf '%s' "$presented" | sha256sum | cut -d' ' -f1)"
+  presented=''
+  expect "$presented_sha" "$authorization_sha" adapter_authorization_sha
+  expect "${APPROVED_PROOF_SHA:-}" "$proof_sha" adapter_approved_proof_sha
+
+  # The in-process nonce proves this context was produced for this invocation.
+  [[ -n "${M8_FORMAL_RUN_NONCE:-}" ]] ||
+    nonformal_refuse 'M8_FORMAL_RUN_NONCE is absent; the context did not come from a live wrapper invocation'
+  expect "$(printf '%s' "$M8_FORMAL_RUN_NONCE" | sha256sum | cut -d' ' -f1)" "$nonce_sha" context_invocation_nonce
+
+  M8_ADAPTER_MODE='FORMAL'
+  AUTHORIZATION_SHA="$authorization_sha"
+  AUTHORIZATION_KIND="$authorization_kind"
+  CLAIM_OBJECT="$claim_object"
+  CONTEXT_CLAIM_SHA256="$claim_sha"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Durable claim verification (independent of the wrapper's in-process state).
+# ---------------------------------------------------------------------------
+claim_verify() {
+  local claim_local="$EVIDENCE/claim-adapter-readback.json"
+  m8_oss_require_config || die 'OSS bucket configuration is required for formal execution'
+
+  if ! m8_oss_get_object "$CLAIM_OBJECT" "$claim_local" "$EVIDENCE/adapter-oss.log"; then
+    die "durable claim could not be read back from $CLAIM_OBJECT; refusing to invoke the semantic core"
+  fi
+  CLAIM_SHA256_LOCAL="$(sha256sum "$claim_local" | cut -d' ' -f1)"
+  expect "$CLAIM_SHA256_LOCAL" "$CONTEXT_CLAIM_SHA256" durable_claim_sha256
+  expect "$(m8_json_get "$claim_local" schema)" 'linguagraph-m8-claim/v1' claim_schema
+  expect "$(m8_json_get "$claim_local" authorization_sha256)" "$AUTHORIZATION_SHA" claim_authorization_sha
+  expect "$(m8_json_get "$claim_local" authorization_kind)" "$AUTHORIZATION_KIND" claim_authorization_kind
+  expect "$(m8_json_get "$claim_local" authorized_executor_id)" \
+    "$(m8_provider_identity_executor_id)" claim_authorized_executor_id
+  expect "$(m8_json_get "$claim_local" executor_id)" \
+    "$(m8_provider_identity_executor_id)" claim_executor_id
+  expect "$(m8_json_get "$claim_local" single_use)" 'true' claim_single_use
+  expect "$(m8_json_get "$claim_local" proof_sha)" "${APPROVED_PROOF_SHA:-}" claim_proof_sha
+  expect "$(m8_json_get "$claim_local" claim_object)" "$CLAIM_OBJECT" claim_object_binding
+  CLAIM_FILE="$claim_local"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Post-claim defence-in-depth provider identity re-verification.
+# ---------------------------------------------------------------------------
+provider_identity_reverify() {
+  local claim=$1 root="$EVIDENCE/provider-identity" observed expected field
+  m8_provider_identity_verify "$root" reexec ||
+    die 'post-claim read-only provider identity verification failed'
+
+  for field in instance_id region_id zone_id instance_type image_id; do
+    observed="$(cat "$root/reexec/${field//_/-}.txt")"
+    expected="$(m8_json_get "$claim" "provider_identity.$field")"
+    expect "$observed" "$expected" "reexec_provider_identity_$field"
+  done
+  observed="$(cat "$root/reexec/instance-identity-document.sha256")"
+  expected="$(m8_json_get "$claim" provider_identity.identity_document_sha256)"
+  expect "$observed" "$expected" reexec_provider_identity_document_sha256
+  observed="$(cat "$root/reexec/instance-identity-pkcs7.sha256")"
+  expected="$(m8_json_get "$claim" provider_identity.identity_pkcs7_sha256)"
+  expect "$observed" "$expected" reexec_provider_identity_pkcs7_sha256
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# EXIT trap: adapter-exit-code.txt is the adapter's final self-declared RC.
+# ---------------------------------------------------------------------------
+adapter_finalize() {
+  local exit_code=$? first_line=''
   trap - EXIT
-  mkdir -p "$EVIDENCE" 2>/dev/null || true
 
-  if [[ ! -e "$EVIDENCE/outcome.txt" ]]; then
-    printf 'FAIL missing_outcome adapter_exit=%s\n' "$exit_code" > "$EVIDENCE/outcome.txt"
-    if (( exit_code == 0 )); then exit_code=1; fi
-  else
-    first_line=$(head -n1 "$EVIDENCE/outcome.txt" 2>/dev/null || printf '')
-    if [[ "$first_line" == 'PASS' && "$exit_code" != 0 ]]; then
+  if (( ADAPTER_CORE_INVOKED == 1 )); then
+    first_line="$(head -n1 "$EVIDENCE/outcome.txt" 2>/dev/null || printf '')"
+    if [[ -z "$first_line" ]]; then
+      printf 'FAIL missing_outcome adapter_exit=%s\n' "$exit_code" > "$EVIDENCE/outcome.txt"
+      (( exit_code == 0 )) && exit_code=1
+    elif [[ "$first_line" == 'PASS' && "$exit_code" != 0 ]]; then
       printf 'FAIL adapter_exit=%s\n' "$exit_code" > "$EVIDENCE/outcome.txt"
     elif [[ "$first_line" != 'PASS' && "$exit_code" == 0 ]]; then
       exit_code=1
     fi
   fi
 
-  write_manifest || packaging_failed=1
-
-  mkdir -p "$ARCHIVE_DIR" 2>/dev/null || packaging_failed=1
-  if [[ -d "$ARCHIVE_DIR" ]]; then
-    archive_name="m8-proof-artifacts-${APPROVED_PROOF_SHA:-unknown}-${AUTHORIZATION_SHA256:-no-authorization}.tar.gz"
-    archive="$ARCHIVE_DIR/$archive_name"
-    build_archive "$archive_name" "$archive" || {
-      archive_rc=$?
-      packaging_failed=1
-      if (( archive_rc == 2 )); then
-        printf 'archive_collision=%s\n' "$archive_name" >> "$EVIDENCE/adapter-packaging.txt"
-      fi
-    }
-  fi
-
-  if (( packaging_failed != 0 )); then
-    printf 'FAIL packaging_failed=1 adapter_exit=%s\n' "$exit_code" > "$EVIDENCE/outcome.txt"
-    exit_code=1
-    write_manifest || true
-    if [[ -d "$ARCHIVE_DIR" && -n "$archive_name" && ! -e "$archive" && ! -e "${archive}.sha256" ]]; then
-      build_archive "$archive_name" "$archive" || true
-    fi
-  fi
-
+  printf '%s\n' "$exit_code" > "$EVIDENCE/adapter-exit-code.txt"
   exit "$exit_code"
 }
 
-guard_provider_binding_ready() {
-  [[ "$PROVIDER_BINDING_READY" == 'YES' ]] || die 'M8 Alibaba provider binding is not established; preparation source cannot execute formal proof'
-  [[ "$EXPECTED_INSTANCE_ID" != 'UNBOUND' ]] || die 'M8 expected instance ID is unbound'
-  [[ "$EXPECTED_REGION_ID" != 'UNBOUND' ]] || die 'M8 expected region is unbound'
-  [[ "$EXPECTED_ZONE_ID" != 'UNBOUND' ]] || die 'M8 expected zone is unbound'
-  [[ "$EXPECTED_INSTANCE_TYPE" != 'UNBOUND' ]] || die 'M8 expected instance type is unbound'
-  [[ "$EXPECTED_IMAGE_ID" != 'UNBOUND' ]] || die 'M8 expected image is unbound'
-}
+context_validate
+mkdir -p "$EVIDENCE" || die "cannot create $EVIDENCE"
+trap adapter_finalize EXIT
+record adapter_mode "$M8_ADAPTER_MODE"
+record authorization_kind "$AUTHORIZATION_KIND"
+record authorization_sha256 "$AUTHORIZATION_SHA"
+record context_claim_sha256 "$CONTEXT_CLAIM_SHA256"
+record date_utc "$(date -u +%FT%TZ)"
 
-guard_no_circleci() {
-  local v
-  for v in CIRCLE_PROJECT_USERNAME CIRCLE_PROJECT_REPONAME CIRCLE_BRANCH            CIRCLE_SHA1 CIRCLE_WORKFLOW_ID CIRCLE_BUILD_NUM; do
-    [[ -z "${!v:-}" ]] || die "CircleCI identity variable $v is set; Alibaba execution must not be obtained by spoofing CircleCI"
-  done
-}
+claim_verify
+provider_identity_reverify "$CLAIM_FILE"
 
-guard_evidence_path() {
-  if [[ -n "$INHERITED_EVIDENCE_DIR" && "$INHERITED_EVIDENCE_DIR" != "$FIXED_EVIDENCE" ]]; then
-    die "M8_PROOF_EVIDENCE_DIR must be unset or exactly $FIXED_EVIDENCE; refusing redirected evidence"
-  fi
-}
+# ---------------------------------------------------------------------------
+# Semantic execution. The core-exit-code.txt capture happens immediately after
+# the child returns and is the only place that file is ever written.
+# ---------------------------------------------------------------------------
+ADAPTER_CORE_INVOKED=1
+CORE_RC=0
+bash "$CORE" || CORE_RC=$?
+printf '%s\n' "$CORE_RC" > "$EVIDENCE/core-exit-code.txt"
+record core_exit_code "$CORE_RC"
 
-guard_host_state_path() {
-  if [[ "$INHERITED_HOME" != "$ACCOUNT_HOME" ]]; then
-    die "HOME must exactly match account home $ACCOUNT_HOME; refusing redirected spent-token authority"
-  fi
-  if [[ -n "$INHERITED_HOST_STATE" && "$INHERITED_HOST_STATE" != "$FIXED_HOST_STATE" ]]; then
-    die "M8_PROOF_HOST_STATE must be unset or exactly $FIXED_HOST_STATE; refusing redirected spent-token authority"
-  fi
-}
-
-guard_clean_start() {
-  [[ ! -e "$EVIDENCE" ]] || die "Pre-existing proof evidence path exists: $EVIDENCE"
-  [[ ! -e "$PROOF_ROOT/candidate" ]] || die "Pre-existing candidate checkout path exists: $PROOF_ROOT/candidate"
-}
-
-guard_proof_sha() {
-  [[ "${APPROVED_PROOF_SHA:-}" =~ ^[0-9a-f]{40}$ ]] || die 'APPROVED_PROOF_SHA must be a full 40-character SHA'
-  expect "$(git -C "$PROOF_ROOT" remote get-url origin 2>/dev/null || printf '')" "$PROOF_ORIGIN_URL" proof_origin_url
-  expect "$(git -C "$PROOF_ROOT" rev-parse --abbrev-ref HEAD)" 'main' proof_branch
-  expect "$(git -C "$PROOF_ROOT" rev-parse HEAD)" "$APPROVED_PROOF_SHA" approved_proof_head
-  expect "$(git -C "$PROOF_ROOT" ls-remote origin refs/heads/main | awk '{print $1}')" "$APPROVED_PROOF_SHA" approved_proof_remote_main
-  [[ -z "$(git -C "$PROOF_ROOT" status --porcelain=v1 --untracked-files=all)" ]] || die 'Dirty proof worktree before evidence creation'
-}
-
-guard_run_authorization() {
-  local token="${M8_PROOF_RUN_AUTHORIZATION:-}"
-  [[ -n "$token" ]] || die "Missing one-shot Human run authorization ($RUN_AUTH_NAMESPACE_DESCRIPTION)"
-
-  local prefix=''
-  if [[ "$token" =~ ^M8-EXI-01-RUN-([A-Fa-f0-9]{7,40})-[A-Za-z0-9_-]+$ ]]; then
-    prefix="${BASH_REMATCH[1]}"
-  else
-    die "Run authorization must match $RUN_AUTH_NAMESPACE_DESCRIPTION"
-  fi
-
-  local lower_prefix="${prefix,,}" token_hash
-  token_hash=$(printf '%s' "$token" | sha256sum | cut -d' ' -f1)
-  AUTHORIZATION_SHA256="$token_hash"
-  expect "${APPROVED_PROOF_SHA:0:${#lower_prefix}}" "$lower_prefix" authorization_proof_sha_prefix
-
-  mkdir -p "$SPENT_DIR"
-  if ! mkdir "$SPENT_DIR/$token_hash" 2>/dev/null; then
-    die "Run authorization was already spent ($token_hash); a rerun requires fresh Human authorization"
-  fi
-
-  record proof_provider alibaba-ecs
-  record authorization_namespace M8-EXI-01
-  record authorization_sha256 "$AUTHORIZATION_SHA256"
-  record approved_proof_sha "$APPROVED_PROOF_SHA"
-  record date_utc "$(date -u +%FT%TZ)"
-}
-
-imds_plain() {
-  curl --silent --output /dev/null --write-out '%{http_code}' --max-time 5 "$IMDS_BASE/$1"
-}
-imds_request_token() {
-  curl --fail --silent --show-error --max-time 5 -X PUT     -H "X-aliyun-ecs-metadata-token-ttl-seconds: $IMDS_TTL" "$IMDS_TOKEN_URL"
-}
-imds_get() {
-  curl --fail --silent --show-error --max-time 5     -H "X-aliyun-ecs-metadata-token: $IMDS_TOKEN" "$IMDS_BASE/$1"
-}
-capture_imds() {
-  local rel=$1 out=$2 value=''
-  if value=$(imds_get "$rel" 2>/dev/null) && [[ -n "$value" ]]; then
-    printf '%s\n' "$value" > "$EVIDENCE/$out"
-  else
-    printf 'unavailable\n' > "$EVIDENCE/$out"
-  fi
-}
-
-guard_and_capture_imds() {
-  local code instance_id region zone itype image mac
-  local identity_document='' identity_pkcs7='' boot_epoch='' boot_utc=''
-
-  code=$(imds_plain meta-data/instance-id)
-  expect "$code" '403' imds_tokenless_instance_id_http_status
-
-  IMDS_TOKEN=$(imds_request_token) || die 'Alibaba IMDS token mode request failed'
-  [[ -n "$IMDS_TOKEN" ]] || die 'Alibaba IMDS token mode returned an empty token'
-
-  instance_id=$(imds_get meta-data/instance-id) || die 'Alibaba IMDS token-mode instance-id request failed'
-  region=$(imds_get meta-data/region-id)
-  zone=$(imds_get meta-data/zone-id)
-  if ! itype=$(imds_get meta-data/instance/instance-type 2>/dev/null); then
-    itype=$(imds_get meta-data/instance-type)
-  fi
-  image=$(imds_get meta-data/image-id)
-
-  expect "$instance_id" "$EXPECTED_INSTANCE_ID" imds_instance_id
-  expect "$region" "$EXPECTED_REGION_ID" imds_region_id
-  expect "$zone" "$EXPECTED_ZONE_ID" imds_zone_id
-  expect "$itype" "$EXPECTED_INSTANCE_TYPE" imds_instance_type
-  expect "$image" "$EXPECTED_IMAGE_ID" imds_image_id
-
-  capture_imds meta-data/instance-id instance-id.txt
-  capture_imds meta-data/instance/instance-name instance-name.txt
-  capture_imds meta-data/hostname hostname.txt
-  capture_imds meta-data/region-id region-id.txt
-  capture_imds meta-data/zone-id zone-id.txt
-  capture_imds meta-data/instance/instance-type instance-type.txt
-  capture_imds meta-data/image-id image-id.txt
-  capture_imds meta-data/serial-number serial-number.txt
-  capture_imds meta-data/vpc-id vpc-id.txt
-  capture_imds meta-data/vswitch-id vswitch-id.txt
-  capture_imds meta-data/private-ipv4 private-ipv4.txt
-  capture_imds meta-data/public-ipv4 public-ipv4.txt
-  capture_imds meta-data/eipv4 eipv4.txt
-  capture_imds meta-data/mac primary-mac.txt
-
-  mac=$(cat "$EVIDENCE/primary-mac.txt" 2>/dev/null || printf '')
-  if [[ -n "$mac" && "$mac" != 'unavailable' ]]; then
-    capture_imds "meta-data/network/interfaces/macs/$mac/network-interface-id" primary-eni.txt
-    capture_imds "meta-data/network/interfaces/macs/$mac/primary-ip-address" primary-eni-private-ipv4.txt
-  else
-    printf 'unavailable\n' > "$EVIDENCE/primary-eni.txt"
-    printf 'unavailable\n' > "$EVIDENCE/primary-eni-private-ipv4.txt"
-  fi
-
-  identity_document=$(imds_get dynamic/instance-identity/document) || die 'Alibaba instance identity document request failed'
-  [[ -n "$identity_document" ]] || die 'Alibaba instance identity document is empty'
-  printf '%s\n' "$identity_document" > "$EVIDENCE/instance-identity-document.json"
-
-  identity_pkcs7=$(imds_get dynamic/instance-identity/pkcs7) || die 'Alibaba instance identity PKCS7 request failed'
-  [[ -n "$identity_pkcs7" ]] || die 'Alibaba instance identity PKCS7 response is empty'
-  printf '%s\n' "$identity_pkcs7" > "$EVIDENCE/instance-identity-pkcs7.txt"
-
-  sha256sum "$EVIDENCE/instance-identity-document.json" | cut -d' ' -f1 > "$EVIDENCE/instance-identity-document.sha256"
-  sha256sum "$EVIDENCE/instance-identity-pkcs7.txt" | cut -d' ' -f1 > "$EVIDENCE/instance-identity-pkcs7.sha256"
-  expect "$(cat "$EVIDENCE/instance-identity-document.sha256")" "$EXPECTED_IDENTITY_DOCUMENT_SHA256" identity_document_sha256
-  expect "$(cat "$EVIDENCE/instance-identity-pkcs7.sha256")" "$EXPECTED_IDENTITY_PKCS7_SHA256" identity_pkcs7_sha256
-
-  {
-    printf 'os_release:\n'
-    cat /etc/os-release
-    printf '\nuname:\n'
-    uname -a
-    printf '\narchitecture=%s\n' "$(uname -m)"
-    printf 'cpu_count=%s\n' "$(nproc)"
-    grep MemTotal /proc/meminfo
-    printf 'boot_time_local=%s\n' "$(uptime -s 2>/dev/null || printf unavailable)"
-    boot_epoch=$(awk '$1 == "btime" {print $2}' /proc/stat)
-    if [[ "$boot_epoch" =~ ^[0-9]+$ ]]; then
-      boot_utc=$(date -u -d "@$boot_epoch" +%FT%TZ) || boot_utc='unavailable'
-    else
-      boot_utc='unavailable'
-    fi
-    printf 'boot_timestamp_utc=%s\n' "$boot_utc"
-  } > "$EVIDENCE/host-facts.txt"
-
-  {
-    printf 'imds_endpoint=%s\n' "$IMDS_BASE"
-    printf 'imds_tokenless_instance_id_http_status=403\n'
-    printf 'imds_token_mode=successful\n'
-    printf 'instance_id=%s\n' "$instance_id"
-    printf 'region_id=%s\n' "$region"
-    printf 'zone_id=%s\n' "$zone"
-    printf 'instance_type=%s\n' "$itype"
-    printf 'image_id=%s\n' "$image"
-    printf 'observed_public_ip=%s\n' "$(cat "$EVIDENCE/public-ipv4.txt" 2>/dev/null || printf unavailable)"
-    printf 'observed_eipv4=%s\n' "$(cat "$EVIDENCE/eipv4.txt" 2>/dev/null || printf unavailable)"
-    printf 'note=public IP, kernel patch version, boot timestamp and runtime-assigned network observations are recorded but are not immutable execution identity\n'
-  } > "$EVIDENCE/alibaba-ecs-provenance.txt"
-}
-
-bootstrap_host() {
-  if command -v docker >/dev/null 2>&1 && { docker info >/dev/null 2>&1 || sudo -n docker info >/dev/null 2>&1; }; then
-    printf 'docker_already_usable=true\n' > "$EVIDENCE/alibaba-bootstrap.txt"
-    return 0
-  fi
-
-  sudo -n true 2>/dev/null || die 'passwordless sudo -n is required for Alibaba host bootstrap'
-  printf 'docker_already_usable=false\n' > "$EVIDENCE/alibaba-bootstrap.txt"
-  sudo -n env DEBIAN_FRONTEND=noninteractive apt-get update
-  sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends docker.io
-
-  if ! sudo -n docker info >/dev/null 2>&1; then
-    sudo -n systemctl start docker >/dev/null 2>&1 || sudo -n service docker start >/dev/null 2>&1 || true
-  fi
-  sudo -n docker info >/dev/null 2>&1 || die 'Docker did not become usable after bootstrap'
-
-  {
-    printf 'docker_io_version=%s\n' "$(dpkg-query -W -f='${Version}' docker.io 2>/dev/null || printf unavailable)"
-    sudo -n docker --version
-  } >> "$EVIDENCE/alibaba-bootstrap.txt"
-}
-
-guard_no_circleci
-guard_evidence_path
-guard_host_state_path
-guard_provider_binding_ready
-guard_proof_sha
-guard_clean_start
-case "$HOST_STATE" in
-  "$PROOF_ROOT"|"$PROOF_ROOT"/*) die 'Host state directory must be outside the git worktree' ;;
-esac
-
-# Only after all clean-start guards pass do failures become formal evidence
-# lifecycle events. This prevents stale ignored evidence from being repackaged.
-trap finalize EXIT
-mkdir -p "$EVIDENCE"
-guard_run_authorization
-guard_and_capture_imds
-bootstrap_host
-
-bash "$CORE" || core_rc=$?
-exit "$core_rc"
+exit "$CORE_RC"
