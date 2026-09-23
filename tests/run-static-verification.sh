@@ -19,6 +19,9 @@ readonly FIXTURES="$REPO_ROOT/tests/fixtures"
 readonly FAKE_OSSUTIL="$FIXTURES/fake-ossutil.sh"
 readonly PYTHON="${M8_PYTHON_BIN:-python3}"
 
+# R2I-C11: the proof-tree canonical config pins the ECS role name.
+readonly C11_ROLE='LinguaGraphM8ProofExecutor'
+
 TMPROOT="$(mktemp -d "${TMPDIR:-/tmp}/m8-r2b-verify.XXXXXX")"
 cleanup() { rm -rf "$TMPROOT"; }
 trap cleanup EXIT
@@ -35,6 +38,10 @@ R2I_C4_TOTAL=0
 R2I_C4_PASS=0
 R2I_C7_TOTAL=0
 R2I_C7_PASS=0
+R2I_C11_TOTAL=0
+R2I_C11_PASS=0
+R2I_C12_TOTAL=0
+R2I_C12_PASS=0
 declare -a FAILED_CHECKS=()
 
 run_check() {
@@ -46,6 +53,8 @@ run_check() {
     r2i) R2I_TOTAL=$((R2I_TOTAL + 1)) ;;
     r2i_c4) R2I_C4_TOTAL=$((R2I_C4_TOTAL + 1)) ;;
     r2i_c7) R2I_C7_TOTAL=$((R2I_C7_TOTAL + 1)) ;;
+    r2i_c11) R2I_C11_TOTAL=$((R2I_C11_TOTAL + 1)) ;;
+    r2i_c12) R2I_C12_TOTAL=$((R2I_C12_TOTAL + 1)) ;;
   esac
   out="$("$fn" 2>&1)" || rc=$?
   if (( rc == 0 )) && ! grep -q '^ASSERT_FAIL:' <<<"$out"; then
@@ -57,6 +66,8 @@ run_check() {
       r2i) R2I_PASS=$((R2I_PASS + 1)) ;;
       r2i_c4) R2I_C4_PASS=$((R2I_C4_PASS + 1)) ;;
       r2i_c7) R2I_C7_PASS=$((R2I_C7_PASS + 1)) ;;
+      r2i_c11) R2I_C11_PASS=$((R2I_C11_PASS + 1)) ;;
+      r2i_c12) R2I_C12_PASS=$((R2I_C12_PASS + 1)) ;;
     esac
   else
     printf 'FAIL [%-6s] %s %s\n' "$kind" "$id" "$desc"
@@ -210,7 +221,7 @@ for arg in "$@"; do
 done
 if [[ -n "${M8_FAKE_IMDS_LOG:-}" ]]; then printf '%s\n' "$url" >>"$M8_FAKE_IMDS_LOG"; fi
 mode="${M8_FAKE_IMDS_ROLE_MODE:-one}"
-role="${M8_FAKE_IMDS_ROLE_NAME:-M8SyntheticObservedRole}"
+role="${M8_FAKE_IMDS_ROLE_NAME:-LinguaGraphM8ProofExecutor}"
 case "$url" in
   */api/token)
     printf 'SYNTHETIC-IMDS-TOKEN-NOT-A-SECRET\n'
@@ -241,6 +252,20 @@ esac
 FAKEIMDS
   chmod +x "$path"
   printf '%s' "$path"
+}
+
+# R2I-C11: arm the durable IMDSv2 provider authority and the offline IMDS stub so
+# the live role cross-binding can be exercised deterministically. Every
+# network-capable OSS path now requires this before building a CLI argument
+# vector.
+c11_arm_provider_seams() {
+  # shellcheck source=/dev/null
+  source "$IDENTITY_LIB"
+  export M8_IMDS_CURL_BIN="$(write_fake_imds_client)"
+  export M8_IMDS_BASE_URL='http://imds.invalid/latest'
+  export M8_FAKE_IMDS_ROLE_MODE='one'
+  export M8_FAKE_IMDS_ROLE_NAME="$C11_ROLE"
+  export M8_OSS_ECS_ROLE_NAME="$C11_ROLE"
 }
 
 # Establish the B03 OSS trust target through the real production guards.
@@ -329,7 +354,7 @@ bootstrap_formal_fixture() {
   export M8_IMDS_CURL_BIN="$(write_fake_imds_client)"
   export M8_IMDS_BASE_URL='http://imds.invalid/latest'
   export M8_FAKE_IMDS_ROLE_MODE='one'
-  export M8_FAKE_IMDS_ROLE_NAME='M8SyntheticObservedRole'
+  export M8_FAKE_IMDS_ROLE_NAME='LinguaGraphM8ProofExecutor'
 
   ISSUED_LOCAL="$SB/issued.json"
   # B1 authorization identity: the Human-issued input is the exact TOKEN string.
@@ -831,6 +856,7 @@ v18() {
   (
     # shellcheck source=/dev/null
     source "$OSS_LIB"
+    c11_arm_provider_seams
     if M8_OSS_BUCKET='NOT_A_VALID_BUCKET' m8_oss_require_config 2>/dev/null; then
       printf 'oss config guard accepted an invalid bucket\n'
       return 1
@@ -884,9 +910,10 @@ v20() {
   (
     # shellcheck source=/dev/null
     source "$OSS_LIB"
+    c11_arm_provider_seams
     export M8_OSS_BUCKET='test-bucket' M8_OSSUTIL_BIN="$FAKE_OSSUTIL"
     export M8_PROOF_ROOT="$REPO_ROOT"
-    export M8_OSS_ECS_ROLE_NAME='M8SyntheticObservedRole'
+    export M8_OSS_ECS_ROLE_NAME='LinguaGraphM8ProofExecutor'
     export M8_FAKE_OSS_ROOT="$TMPROOT/v20-oss"
     mkdir -p "$M8_FAKE_OSS_ROOT"
     M8_FAKE_OSS_CAPABILITY=full m8_oss_capability_guard - || return 1
@@ -901,9 +928,10 @@ v21() {
   (
     # shellcheck source=/dev/null
     source "$OSS_LIB"
+    c11_arm_provider_seams
     export M8_OSS_BUCKET='test-bucket' M8_OSSUTIL_BIN="$FAKE_OSSUTIL"
     export M8_PROOF_ROOT="$REPO_ROOT"
-    export M8_OSS_ECS_ROLE_NAME='M8SyntheticObservedRole'
+    export M8_OSS_ECS_ROLE_NAME='LinguaGraphM8ProofExecutor'
     export M8_FAKE_OSS_ROOT="$TMPROOT/v21-oss" M8_FAKE_OSS_VERSIONING='enabled'
     mkdir -p "$M8_FAKE_OSS_ROOT"
     if m8_oss_versioning_guard -; then printf 'versioning Enabled was accepted\n'; return 1; fi
@@ -914,9 +942,10 @@ v22() {
   (
     # shellcheck source=/dev/null
     source "$OSS_LIB"
+    c11_arm_provider_seams
     export M8_OSS_BUCKET='test-bucket' M8_OSSUTIL_BIN="$FAKE_OSSUTIL"
     export M8_PROOF_ROOT="$REPO_ROOT"
-    export M8_OSS_ECS_ROLE_NAME='M8SyntheticObservedRole'
+    export M8_OSS_ECS_ROLE_NAME='LinguaGraphM8ProofExecutor'
     export M8_FAKE_OSS_ROOT="$TMPROOT/v22-oss" M8_FAKE_OSS_VERSIONING='suspended'
     mkdir -p "$M8_FAKE_OSS_ROOT"
     if m8_oss_versioning_guard -; then printf 'versioning Suspended was accepted\n'; return 1; fi
@@ -927,9 +956,10 @@ v23() {
   (
     # shellcheck source=/dev/null
     source "$OSS_LIB"
+    c11_arm_provider_seams
     export M8_OSS_BUCKET='test-bucket' M8_OSSUTIL_BIN="$FAKE_OSSUTIL"
     export M8_PROOF_ROOT="$REPO_ROOT"
-    export M8_OSS_ECS_ROLE_NAME='M8SyntheticObservedRole'
+    export M8_OSS_ECS_ROLE_NAME='LinguaGraphM8ProofExecutor'
     mkdir -p "$TMPROOT/v23-oss"
     export M8_FAKE_OSS_ROOT="$TMPROOT/v23-oss"
     M8_FAKE_OSS_VERSIONING='unversioned' m8_oss_versioning_guard - || return 1
@@ -941,9 +971,10 @@ v24() {
   (
     # shellcheck source=/dev/null
     source "$OSS_LIB"
+    c11_arm_provider_seams
     export M8_OSS_BUCKET='test-bucket' M8_OSSUTIL_BIN="$FAKE_OSSUTIL"
     export M8_PROOF_ROOT="$REPO_ROOT"
-    export M8_OSS_ECS_ROLE_NAME='M8SyntheticObservedRole'
+    export M8_OSS_ECS_ROLE_NAME='LinguaGraphM8ProofExecutor'
     mkdir -p "$TMPROOT/v24-oss"
     export M8_FAKE_OSS_ROOT="$TMPROOT/v24-oss"
     if M8_FAKE_OSS_VERSIONING='garbage' m8_oss_versioning_guard -; then
@@ -959,9 +990,10 @@ v25() {
   (
     # shellcheck source=/dev/null
     source "$OSS_LIB"
+    c11_arm_provider_seams
     export M8_OSS_BUCKET='test-bucket' M8_OSSUTIL_BIN="$FAKE_OSSUTIL"
     export M8_PROOF_ROOT="$REPO_ROOT"
-    export M8_OSS_ECS_ROLE_NAME='M8SyntheticObservedRole'
+    export M8_OSS_ECS_ROLE_NAME='LinguaGraphM8ProofExecutor'
     export M8_FAKE_OSS_ROOT="$TMPROOT/v25-oss"
     mkdir -p "$M8_FAKE_OSS_ROOT"
     local first="$TMPROOT/v25-a.txt" second="$TMPROOT/v25-b.txt" rc=0
@@ -983,9 +1015,10 @@ v26() {
   (
     # shellcheck source=/dev/null
     source "$OSS_LIB"
+    c11_arm_provider_seams
     export M8_OSS_BUCKET='test-bucket' M8_OSSUTIL_BIN="$FAKE_OSSUTIL"
     export M8_PROOF_ROOT="$REPO_ROOT"
-    export M8_OSS_ECS_ROLE_NAME='M8SyntheticObservedRole'
+    export M8_OSS_ECS_ROLE_NAME='LinguaGraphM8ProofExecutor'
     export M8_FAKE_OSS_ROOT="$TMPROOT/v26-oss" M8_FAKE_OSS_MUTATION_LOG="$log"
     export M8_FAKE_OSS_VERSIONING='unversioned'
     mkdir -p "$M8_FAKE_OSS_ROOT"
@@ -1316,7 +1349,7 @@ bootstrap_retry_fixture() {
   export M8_IMDS_CURL_BIN="$(write_fake_imds_client)"
   export M8_IMDS_BASE_URL='http://imds.invalid/latest'
   export M8_FAKE_IMDS_ROLE_MODE='one'
-  export M8_FAKE_IMDS_ROLE_NAME='M8SyntheticObservedRole'
+  export M8_FAKE_IMDS_ROLE_NAME='LinguaGraphM8ProofExecutor'
 
   # R2I-C4/B03: derive the exact trust-profile digest the production guards will
   # compute, in an isolated subshell so the fixture cannot drift from the real
@@ -1772,9 +1805,10 @@ c05() {
   (
     # shellcheck source=/dev/null
     source "$OSS_LIB"
+    c11_arm_provider_seams
     export M8_OSS_BUCKET='test-bucket' M8_OSSUTIL_BIN="$FAKE_OSSUTIL"
     export M8_PROOF_ROOT="$REPO_ROOT"
-    export M8_OSS_ECS_ROLE_NAME='M8SyntheticObservedRole'
+    export M8_OSS_ECS_ROLE_NAME='LinguaGraphM8ProofExecutor'
     export M8_FAKE_OSS_ROOT="$TMPROOT/c05-oss" M8_FAKE_OSS_VERSIONING='unversioned'
     export M8_FAKE_OSS_BODY_LOG="$TMPROOT/c05-body.log"
     mkdir -p "$M8_FAKE_OSS_ROOT"
@@ -2262,8 +2296,9 @@ t02() {
   (
     # shellcheck source=/dev/null
     source "$OSS_LIB"
+    c11_arm_provider_seams
     export M8_PROOF_ROOT="$REPO_ROOT" M8_OSS_BUCKET='test-bucket'
-    export M8_OSSUTIL_BIN="$FAKE_OSSUTIL" M8_OSS_ECS_ROLE_NAME='M8SyntheticObservedRole'
+    export M8_OSSUTIL_BIN="$FAKE_OSSUTIL" M8_OSS_ECS_ROLE_NAME='LinguaGraphM8ProofExecutor'
     export M8_FAKE_OSS_ROOT="$TMPROOT/t02-oss" M8_FAKE_OSS_LOCATION='cn-hongkong'
     export M8_FAKE_OSS_VERSIONING='unversioned'
     export M8_FAKE_OSS_ARG_LOG="$TMPROOT/t02-args.log"
@@ -2285,24 +2320,39 @@ t02() {
     for operation in put-object head-object get-object get-bucket-versioning get-bucket-location; do
       assert_eq "$(grep -c "operation=$operation " "$M8_FAKE_OSS_ARG_LOG")" '1' "$operation issued through the pinned CLI"
     done
-    assert_eq "$(grep -c "config_file=$config region=cn-hongkong endpoint=https://oss-cn-hongkong-internal.aliyuncs.com mode=EcsRamRole ecs_role_name=M8SyntheticObservedRole addressing_style=virtual ignore_env_var=yes forbidden=none" "$M8_FAKE_OSS_ARG_LOG")" \
-      '5' 'every call carries the exact frozen trust target'
+    # R2I-C11: every call carries exactly the FIVE CLI-pinned global flags, and
+    # the auth binding comes from the canonical config file -- never from a CLI
+    # --mode or --ecs-role-name (ossutil 2.4.0 supports neither).
+    assert_eq "$(grep -c "config_file=$config region=cn-hongkong endpoint=https://oss-cn-hongkong-internal.aliyuncs.com config_mode=Ali-EcsRamRole config_role=LinguaGraphM8ProofExecutor cli_mode=none cli_role=none addressing_style=virtual ignore_env_var=yes forbidden=none" "$M8_FAKE_OSS_ARG_LOG")" \
+      '5' 'every call carries the five frozen CLI pins and the config role binding'
+    assert_no_grep 'cli_mode=Ali-EcsRamRole|cli_mode=EcsRamRole|cli_role=LinguaGraphM8ProofExecutor' "$M8_FAKE_OSS_ARG_LOG"
     assert_no_grep 'skip-verify-cert|access-key-id|access-key-secret|sts-token|ram-role-arn|role-session-name' "$M8_FAKE_OSS_ARG_LOG"
 
-    # The trust target cannot be assembled without an observed role, and the
-    # captured role name is the live observed value rather than a constant.
-    local missing_role=0
-    if M8_OSS_ECS_ROLE_NAME='' m8_oss_global_args 2>/dev/null; then missing_role=1; fi
-    assert_eq "$missing_role" '0' 'global args refuse an unobserved role'
-    assert_eq "$(M8_OSS_ECS_ROLE_NAME='M8OtherObservedRole' m8_oss_global_args; printf '%s\n' "${M8_OSS_GLOBAL_ARGS[@]}" | sed -n '10p')" \
-      'M8OtherObservedRole' 'role name is taken from the observation, not hard-coded'
-    assert_no_grep 'M8SyntheticObservedRole' "$OSS_LIB"
+    # The frozen argument vector is five flags = nine argv tokens, with no role
+    # flag of any kind.
+    m8_oss_global_args >/dev/null || { printf 'T02: global args failed\n'; return 1; }
+    assert_eq "${#M8_OSS_GLOBAL_ARGS[@]}" '9' 'five pinned flags expand to nine argv tokens'
+    local joined=" ${M8_OSS_GLOBAL_ARGS[*]} "
+    assert_eq "$([[ "$joined" == *' --mode '* ]] && echo present || echo absent)" 'absent' 'no CLI --mode'
+    assert_eq "$([[ "$joined" == *' --ecs-role-name '* ]] && echo present || echo absent)" 'absent' 'no CLI --ecs-role-name'
+
+    # The live cross-binding fails closed before any CLI vector is produced.
+    local role_rc=0
+    ( M8_OSS_ECS_ROLE_NAME='' m8_oss_global_args ) >/dev/null 2>&1 || role_rc=$?
+    assert_eq "$role_rc" '1' 'global args refuse an unobserved role'
+    role_rc=0
+    ( M8_OSS_ECS_ROLE_NAME='M8OtherObservedRole' m8_oss_global_args ) >/dev/null 2>&1 || role_rc=$?
+    assert_eq "$role_rc" '1' 'global args refuse a stored role that disagrees with the config'
+    role_rc=0
+    ( M8_FAKE_IMDS_ROLE_MODE='zero' m8_oss_global_args ) >/dev/null 2>&1 || role_rc=$?
+    assert_eq "$role_rc" '1' 'global args fail closed when the live role observation yields no role'
+    assert_no_grep 'LinguaGraphM8ProofExecutor' "$OSS_LIB"
 
     assert_eq "$M8_OSS_REGION" 'cn-hongkong' 'frozen region'
     assert_eq "$M8_OSS_ENDPOINT" 'https://oss-cn-hongkong-internal.aliyuncs.com' 'frozen HTTPS internal endpoint'
     assert_eq "$M8_OSS_ENDPOINT_CLASS" 'INTERNAL' 'frozen endpoint class'
     assert_eq "$M8_OSS_NETWORK_POLICY" 'SAME_REGION_INTERNAL_ONLY' 'frozen network policy'
-    assert_eq "$M8_OSS_AUTH_MODE" 'EcsRamRole' 'frozen auth mode'
+    assert_eq "$M8_OSS_AUTH_MODE" 'Ali-EcsRamRole' 'frozen auth mode'
     assert_eq "$M8_OSS_ADDRESSING_STYLE" 'virtual' 'frozen addressing style'
     assert_eq "$M8_OSS_TLS_VERIFICATION" 'required' 'frozen TLS verification policy'
     assert_eq "$M8_OSS_IGNORE_ENV_VARS" 'true' 'ambient OSS_ env vars are ignored'
@@ -2312,10 +2362,10 @@ t02() {
 t03() {
   local config="$REPO_ROOT/scripts/config/m8-ossutil-formal.ini"
   assert_file "$config"
-  assert_eq "$(wc -c <"$config" | tr -d '[:space:]')" '22' 'canonical config byte count'
+  assert_eq "$(wc -c <"$config" | tr -d '[:space:]')" '81' 'canonical config byte count'
   assert_eq "$(sha256sum "$config" | cut -d' ' -f1)" \
-    '76e66fda3cb1279873039930dcf15834f56067434423781dbdd94d84de5a011e' 'canonical config digest'
-  assert_eq "$(printf '[default]\nlanguage=EN\n' | sha256sum | cut -d' ' -f1)" \
+    '43b384710e4d0944fa3fea3f4daf4dcaba280739cc40d9c31bdbd6c54772c47a' 'canonical config digest'
+  assert_eq "$(printf '[default]\nlanguage=EN\nmode=Ali-EcsRamRole\necsRoleName=LinguaGraphM8ProofExecutor\n' | sha256sum | cut -d' ' -f1)" \
     "$(sha256sum "$config" | cut -d' ' -f1)" 'canonical config exact bytes'
   assert_eq "$(tr -cd '\r' <"$config" | wc -c | tr -d '[:space:]')" '0' 'canonical config has no CR'
   assert_eq "$(head -c 3 "$config")" '[de' 'canonical config has no BOM'
@@ -2323,6 +2373,7 @@ t03() {
   (
     # shellcheck source=/dev/null
     source "$OSS_LIB"
+    c11_arm_provider_seams
     export M8_OSS_BUCKET='test-bucket' M8_OSSUTIL_BIN="$FAKE_OSSUTIL"
     local scratch="$TMPROOT/t03-tree"
     mkdir -p "$scratch"
@@ -2343,9 +2394,13 @@ t03() {
       printf 'T03: an absent canonical config was accepted\n'; return 1
     fi
 
-    printf '[default]\nlanguage=EN\nendpoint=evil.example\n' >"$target"
+    printf '[default]\nlanguage=EN\nmode=Ali-EcsRamRole\necsRoleName=LinguaGraphM8ProofExecutor\nendpoint=evil.example\n' >"$target"
     if m8_oss_canonical_config_guard - 2>/dev/null; then
       printf 'T03: a config carrying a forbidden endpoint key was accepted\n'; return 1
+    fi
+    printf '[default]\nlanguage=EN\nmode=Ali-EcsRamRole\necsRoleName=WrongRole\n' >"$target"
+    if m8_oss_canonical_config_guard - 2>/dev/null; then
+      printf 'T03: a config naming a different role was accepted\n'; return 1
     fi
 
     rm -f "$target"
@@ -2380,8 +2435,9 @@ t04() {
   (
     # shellcheck source=/dev/null
     source "$OSS_LIB"
+    c11_arm_provider_seams
     export M8_PROOF_ROOT="$REPO_ROOT" M8_OSS_BUCKET='test-bucket'
-    export M8_OSS_ECS_ROLE_NAME='M8SyntheticObservedRole'
+    export M8_OSS_ECS_ROLE_NAME='LinguaGraphM8ProofExecutor'
     local dir="$TMPROOT/t04" stub
     mkdir -p "$dir"
 
@@ -2445,8 +2501,9 @@ t05() {
   (
     # shellcheck source=/dev/null
     source "$OSS_LIB"
+    c11_arm_provider_seams
     export M8_PROOF_ROOT="$REPO_ROOT" M8_OSS_BUCKET='test-bucket'
-    export M8_OSSUTIL_BIN="$FAKE_OSSUTIL" M8_OSS_ECS_ROLE_NAME='M8SyntheticObservedRole'
+    export M8_OSSUTIL_BIN="$FAKE_OSSUTIL" M8_OSS_ECS_ROLE_NAME='LinguaGraphM8ProofExecutor'
     export M8_FAKE_OSS_ROOT="$TMPROOT/t05-oss" M8_FAKE_OSS_VERSIONING='unversioned'
     export M8_FAKE_OSS_MUTATION_LOG="$TMPROOT/t05-mut.log"
     export M8_FAKE_OSS_ARG_LOG="$TMPROOT/t05-args.log"
@@ -2492,10 +2549,10 @@ t06() {
 
     # PASS: exactly one valid role.
     local name
-    name="$(M8_FAKE_IMDS_ROLE_MODE='one' M8_FAKE_IMDS_ROLE_NAME='M8SyntheticObservedRole' \
+    name="$(M8_FAKE_IMDS_ROLE_MODE='one' M8_FAKE_IMDS_ROLE_NAME='LinguaGraphM8ProofExecutor' \
       m8_provider_identity_observe_ecs_role_name)" ||
       { printf 'T06: a single-role observation failed\n'; return 1; }
-    assert_eq "$name" 'M8SyntheticObservedRole' 'observed role name'
+    assert_eq "$name" 'LinguaGraphM8ProofExecutor' 'observed role name'
 
     # FAIL: zero, multiple, CR/control ambiguity.
     local mode
@@ -2517,7 +2574,7 @@ t06() {
     assert_contains "$nul_err" 'ECS role-name response contains a NUL byte'
     assert_contains "$nul_err" 'NUL'
     assert_eq "$(wc -c <"$nul_out" | tr -d '[:space:]')" '0' 'no validated role emitted for a NUL response'
-    assert_no_grep 'M8SyntheticObservedRole|M8SyntheticNulSuffix' "$nul_out"
+    assert_no_grep 'LinguaGraphM8ProofExecutor|M8SyntheticNulSuffix' "$nul_out"
     # The corrected data flow never puts the raw NUL body through command
     # substitution, so Bash must not emit its lossy warning on either stream.
     assert_no_grep 'ignored null byte in input' "$nul_err"
@@ -2572,8 +2629,9 @@ t07() {
   (
     # shellcheck source=/dev/null
     source "$OSS_LIB"
+    c11_arm_provider_seams
     export M8_PROOF_ROOT="$REPO_ROOT" M8_OSS_BUCKET='test-bucket'
-    export M8_OSS_ECS_ROLE_NAME='M8SyntheticObservedRole'
+    export M8_OSS_ECS_ROLE_NAME='LinguaGraphM8ProofExecutor'
     export M8_OSSUTIL_VERSION='2.2.0'
     export M8_OSSUTIL_BINARY_SHA256="$(sha256sum "$FAKE_OSSUTIL" | cut -d' ' -f1)"
 
@@ -3251,6 +3309,718 @@ PY
 }
 
 # ===========================================================================
+# R2I-C11 — auth-path correction regressions (S01..S18).
+#
+# The live runtime proved that ossutil 2.4.0 supports NEITHER a CLI
+# --ecs-role-name ("unknown flag") NOR Ali-EcsRamRole through CLI --mode
+# ("invalid value for flag(s) mode"). The role binding therefore moved into the
+# proof-tree canonical config and is cross-bound against a fresh IMDSv2 role-name
+# observation. These regressions prove the corrected auth path end to end.
+# ===========================================================================
+
+c11_config_path() { printf '%s' "$REPO_ROOT/scripts/config/m8-ossutil-formal.ini"; }
+
+# Arm a complete synthetic network-capable OSS environment.
+c11_arm_oss_env() {
+  # shellcheck source=/dev/null
+  source "$OSS_LIB"
+  c11_arm_provider_seams
+  export M8_PROOF_ROOT="$REPO_ROOT"
+  export M8_OSS_BUCKET='test-bucket'
+  export M8_OSSUTIL_BIN="$FAKE_OSSUTIL"
+  export M8_FAKE_OSS_ROOT="$TMPROOT/c11-oss"
+  export M8_FAKE_OSS_LOCATION='cn-hongkong'
+  export M8_FAKE_OSS_VERSIONING='unversioned'
+  export M8_FAKE_OSS_MUTATION_LOG="$TMPROOT/c11-mut.log"
+  export M8_FAKE_OSS_ARG_LOG="$TMPROOT/c11-args.log"
+  mkdir -p "$M8_FAKE_OSS_ROOT/objects"
+  : >"$M8_FAKE_OSS_MUTATION_LOG"
+  : >"$M8_FAKE_OSS_ARG_LOG"
+}
+
+s01() {
+  assert_eq "$(wc -c <"$(c11_config_path)" | tr -d '[:space:]')" '81' 'C11 canonical config byte count'
+}
+
+s02() {
+  assert_eq "$(sha256sum "$(c11_config_path)" | cut -d' ' -f1)" \
+    '43b384710e4d0944fa3fea3f4daf4dcaba280739cc40d9c31bdbd6c54772c47a' 'C11 canonical config digest'
+}
+
+s03() {
+  assert_eq "$(cat "$(c11_config_path)")" \
+    "$(printf '[default]\nlanguage=EN\nmode=Ali-EcsRamRole\necsRoleName=LinguaGraphM8ProofExecutor')" \
+    'C11 canonical config exact semantic content'
+  assert_eq "$(tr -cd '\r' <"$(c11_config_path)" | wc -c | tr -d '[:space:]')" '0' 'C11 config has no CR'
+  assert_eq "$(tail -c 1 "$(c11_config_path)" | od -An -tx1 | tr -d ' \n')" '0a' 'C11 config has exactly one final LF'
+}
+
+s04() {
+  (
+    c11_arm_oss_env
+    m8_oss_global_args >/dev/null || { printf 'S04: global args failed\n'; return 1; }
+    local -a want=(--config-file "$REPO_ROOT/scripts/config/m8-ossutil-formal.ini" --region cn-hongkong \
+      --endpoint https://oss-cn-hongkong-internal.aliyuncs.com --addressing-style virtual --ignore-env-var)
+    assert_eq "${M8_OSS_GLOBAL_ARGS[*]}" "${want[*]}" 'C11 production CLI vector is exactly the five frozen pins'
+  )
+}
+
+s05() {
+  (
+    c11_arm_oss_env
+    m8_oss_global_args >/dev/null || { printf 'S05: global args failed\n'; return 1; }
+    local joined=" ${M8_OSS_GLOBAL_ARGS[*]} "
+    assert_eq "$([[ "$joined" == *' --mode '* ]] && echo present || echo absent)" 'absent' 'C11 vector has no --mode'
+    assert_eq "$([[ "$joined" == *' --ecs-role-name '* ]] && echo present || echo absent)" 'absent' 'C11 vector has no --ecs-role-name'
+  )
+}
+
+s06() {
+  local cap out
+  for cap in full no-forbid-overwrite no-global-flags no-location; do
+    out="$(M8_FAKE_OSS_ROOT="$TMPROOT" M8_FAKE_OSS_CAPABILITY="$cap" "$FAKE_OSSUTIL" help 2>&1)"
+    grep -q 'ecs-role-name' <<<"$out" &&
+      { printf 'S06: synthetic help advertises --ecs-role-name for capability %s\n' "$cap"; return 1; }
+  done
+  return 0
+}
+
+s07() {
+  # Exact ossutil 2.4.0 CLI surface, both facts taken from the captured live
+  # runtime: `--ecs-role-name` is not a flag at all, and the help declares the
+  # exact CLI --mode valid set
+  #     valid value(s): "AK","StsToken","EcsRamRole","Anonymous"
+  # so `Ali-EcsRamRole` and `RamRoleArn` are NOT CLI-valid modes. Everything here
+  # is a parser-surface assertion against the synthetic stub (a local directory
+  # that never handles credentials); the production path passes no CLI --mode.
+  local out rc=0
+
+  # (1) --ecs-role-name is not a flag.
+  out="$(M8_FAKE_OSS_ROOT="$TMPROOT" "$FAKE_OSSUTIL" --config-file "$(c11_config_path)" \
+    --ecs-role-name Foo api get-bucket-location --bucket b 2>&1)" || rc=$?
+  (( rc != 0 )) || { printf 'S07: the synthetic ossutil accepted a CLI --ecs-role-name\n'; return 1; }
+  assert_contains <(printf '%s\n' "$out") 'unknown flag: --ecs-role-name'
+
+  # (2) Ali-EcsRamRole is not a valid CLI --mode value (live-proven).
+  rc=0
+  out="$(M8_FAKE_OSS_ROOT="$TMPROOT" "$FAKE_OSSUTIL" --config-file "$(c11_config_path)" \
+    --mode Ali-EcsRamRole api get-bucket-location --bucket b 2>&1)" || rc=$?
+  (( rc != 0 )) || { printf 'S07: the synthetic ossutil accepted CLI --mode Ali-EcsRamRole\n'; return 1; }
+  assert_contains <(printf '%s\n' "$out") 'invalid value for flag(s) "mode"'
+
+  # (3) RamRoleArn is absent from the captured valid set: the synthetic surface
+  #     must not invent a CLI mode the real binary rejects.
+  rc=0
+  out="$(M8_FAKE_OSS_ROOT="$TMPROOT" "$FAKE_OSSUTIL" --config-file "$(c11_config_path)" \
+    --mode RamRoleArn api get-bucket-location --bucket b 2>&1)" || rc=$?
+  (( rc != 0 )) || { printf 'S07: the synthetic ossutil accepted CLI --mode RamRoleArn\n'; return 1; }
+  assert_contains <(printf '%s\n' "$out") 'invalid value for flag(s) "mode"'
+
+  # (4) exactly the four captured valid CLI --mode values are accepted at the
+  #     parser. `version` is a local credential-free banner command, so this is a
+  #     parser-only assertion that exercises no credential boundary.
+  local mode
+  for mode in AK StsToken EcsRamRole Anonymous; do
+    rc=0
+    out="$(M8_FAKE_OSS_ROOT="$TMPROOT" "$FAKE_OSSUTIL" --config-file "$(c11_config_path)" \
+      --mode "$mode" version 2>&1)" || rc=$?
+    assert_eq "$rc" '0' "S07: the synthetic parser must accept CLI --mode $mode"
+    assert_contains <(printf '%s\n' "$out") 'ossutil version'
+  done
+
+  # (5) an accepted mode is genuinely parsed and recorded, not merely tolerated.
+  #     The Anonymous probe is a read-only synthetic call against a local
+  #     directory; no credential is read, printed or persisted.
+  local alog="$TMPROOT/s07-args.log"
+  : >"$alog"
+  M8_FAKE_OSS_ROOT="$TMPROOT" M8_FAKE_OSS_ARG_LOG="$alog" M8_FAKE_OSS_LOCATION='cn-hongkong' \
+    "$FAKE_OSSUTIL" --config-file "$(c11_config_path)" --mode Anonymous \
+    api get-bucket-location --bucket b >/dev/null 2>&1 ||
+    { printf 'S07: the synthetic parser rejected CLI --mode Anonymous on an api call\n'; return 1; }
+  assert_contains "$alog" 'cli_mode=Anonymous cli_role=none'
+
+  # (6) the production path is config-only: the five-pin vector carries neither
+  #     --mode nor --ecs-role-name.
+  (
+    c11_arm_oss_env
+    m8_oss_global_args >/dev/null || { printf 'S07: global args failed\n'; return 1; }
+    local joined=" ${M8_OSS_GLOBAL_ARGS[*]} "
+    assert_eq "$([[ "$joined" == *' --mode '* ]] && echo present || echo absent)" 'absent' \
+      'S07: the production CLI vector must not carry a --mode'
+    assert_eq "$([[ "$joined" == *' --ecs-role-name '* ]] && echo present || echo absent)" 'absent' \
+      'S07: the production CLI vector must not carry an --ecs-role-name'
+  )
+}
+
+s08() {
+  (
+    c11_arm_oss_env
+    local rc=0
+    ( M8_OSS_ECS_ROLE_NAME='' m8_oss_global_args ) >/dev/null 2>&1 || rc=$?
+    assert_eq "$rc" '1' 'S08: a missing stored observed role fails closed'
+    assert_eq "$(wc -l <"$M8_FAKE_OSS_ARG_LOG" | tr -d '[:space:]')" '0' 'S08: no OSS invocation was issued'
+  )
+}
+
+s09() {
+  (
+    c11_arm_oss_env
+    local rc=0
+    ( M8_OSS_ECS_ROLE_NAME='LinguaGraphM8ProofExecutor-OTHER' m8_oss_global_args ) >/dev/null 2>&1 || rc=$?
+    assert_eq "$rc" '1' 'S09: a stored role disagreeing with the config role fails closed'
+    assert_eq "$(wc -l <"$M8_FAKE_OSS_ARG_LOG" | tr -d '[:space:]')" '0' 'S09: no OSS invocation was issued'
+    # The purely local eligibility gate must reject it too, so the stored/config
+    # binding is enforced even on the non-network trust-profile path.
+    export M8_OSSUTIL_VERSION='2.4.0' M8_OSSUTIL_BINARY_SHA256='00'
+    rc=0
+    ( M8_OSS_ECS_ROLE_NAME='LinguaGraphM8ProofExecutor-OTHER' m8_oss_trust_profile_assert_canonical )       >/dev/null 2>&1 || rc=$?
+    assert_eq "$rc" '1' 'S09: the eligibility gate rejects a stored role that disagrees with the config'
+  )
+}
+
+s10() {
+  (
+    c11_arm_oss_env
+    local rc=0
+    ( M8_FAKE_IMDS_ROLE_NAME='LinguaGraphM8ProofExecutor-FRESH-OTHER' m8_oss_global_args ) >/dev/null 2>&1 || rc=$?
+    assert_eq "$rc" '1' 'S10: a fresh live role disagreeing with stored/config fails closed'
+    assert_eq "$(wc -l <"$M8_FAKE_OSS_ARG_LOG" | tr -d '[:space:]')" '0' 'S10: no OSS invocation was issued'
+  )
+}
+
+s11() {
+  (
+    c11_arm_oss_env
+    local rc=0
+    ( unset -f m8_provider_identity_observe_ecs_role_name; m8_oss_global_args ) >/dev/null 2>&1 || rc=$?
+    assert_eq "$rc" '1' 'S11: a missing durable provider helper fails closed (no stored-value fallback)'
+    assert_eq "$(wc -l <"$M8_FAKE_OSS_ARG_LOG" | tr -d '[:space:]')" '0' 'S11: no OSS invocation was issued'
+  )
+}
+
+s12() {
+  (
+    c11_arm_oss_env
+    m8_oss_global_args >/dev/null || { printf 'S12: the fully bound vector was rejected\n'; return 1; }
+    m8_oss_api get-bucket-location --bucket test-bucket >/dev/null ||
+      { printf 'S12: the synthetic OSS invocation failed\n'; return 1; }
+    assert_eq "$(grep -c '^READ get-bucket-location test-bucket$' "$M8_FAKE_OSS_MUTATION_LOG")" '1' 'S12: the call reached the synthetic store'
+    assert_eq "$(grep -c 'config_role=LinguaGraphM8ProofExecutor cli_mode=none cli_role=none' "$M8_FAKE_OSS_ARG_LOG")" '1' \
+      'S12: the call carried the config role and no CLI role'
+    export M8_OSSUTIL_VERSION='2.4.0' M8_OSSUTIL_BINARY_SHA256='00'
+    m8_oss_trust_profile_assert_canonical ||
+      { printf 'S12: the eligibility gate rejected a fully bound profile\n'; return 1; }
+  )
+}
+
+s13() {
+  (
+    # shellcheck source=/dev/null
+    source "$OSS_LIB"
+    assert_eq "$M8_OSS_AUTH_MODE" 'Ali-EcsRamRole' 'S13: frozen auth mode constant'
+  )
+}
+
+s14() {
+  (
+    # shellcheck source=/dev/null
+    source "$OSS_LIB"
+    assert_eq "$M8_OSS_CONFIG_POLICY_ID" 'm8-proof-tree-imdsv2-role-config/v1' 'S14: config policy id'
+    assert_eq "$M8_OSS_CONFIG_BYTES" '81' 'S14: config byte constant'
+    assert_eq "$M8_OSS_CONFIG_SHA256" \
+      '43b384710e4d0944fa3fea3f4daf4dcaba280739cc40d9c31bdbd6c54772c47a' 'S14: config sha constant'
+  )
+}
+
+s15() {
+  (
+    c11_arm_oss_env
+    export M8_OSSUTIL_VERSION='2.4.0'
+    export M8_OSSUTIL_BINARY_SHA256="$(sha256sum "$FAKE_OSSUTIL" | cut -d' ' -f1)"
+    local -a order=(
+      schema oss_bucket oss_region effective_oss_endpoint endpoint_class network_policy
+      addressing_style oss_auth_mode ecs_role_name ossutil_version ossutil_binary_sha256
+      config_relpath config_sha256 config_profile config_policy_id ignore_oss_env_vars
+      env_policy_id tls_verification
+    )
+    assert_eq "$(m8_oss_trust_profile_values | grep -c '^[a-z0-9_]*=')" '18' 'S15: exactly 18 records'
+    assert_eq "$(m8_oss_trust_profile_values | cut -d= -f1 | tr '\n' ' ')" \
+      "$(printf '%s ' "${order[@]}")" 'S15: frozen field order'
+    assert_eq "$(m8_oss_trust_profile_values | tr -cd '\n' | wc -c | tr -d '[:space:]')" '18' 'S15: one LF per record'
+    assert_eq "$(m8_oss_trust_profile_values | tail -c 1 | od -An -tx1 | tr -d ' \n')" '0a' 'S15: exactly one final LF'
+    assert_eq "$(m8_oss_trust_profile_values | tr -cd '\r\000' | wc -c | tr -d '[:space:]')" '0' 'S15: no CR or NUL'
+    assert_eq "$(head -c 3 <(m8_oss_trust_profile_values))" 'sch' 'S15: no BOM'
+  )
+}
+
+s16() {
+  (
+    c11_arm_oss_env
+    export M8_OSSUTIL_VERSION='2.4.0' M8_OSSUTIL_BINARY_SHA256='00'
+    local profile
+    profile="$(m8_oss_trust_profile_values)"
+    grep -qxF 'oss_auth_mode=Ali-EcsRamRole' <<<"$profile" ||
+      { printf 'S16: profile does not record the new auth mode\n'; return 1; }
+    grep -qxF 'config_sha256=43b384710e4d0944fa3fea3f4daf4dcaba280739cc40d9c31bdbd6c54772c47a' <<<"$profile" ||
+      { printf 'S16: profile does not record the new config sha\n'; return 1; }
+    grep -qxF 'config_policy_id=m8-proof-tree-imdsv2-role-config/v1' <<<"$profile" ||
+      { printf 'S16: profile does not record the new config policy id\n'; return 1; }
+    grep -qxF 'ecs_role_name=LinguaGraphM8ProofExecutor' <<<"$profile" ||
+      { printf 'S16: profile does not record the observed role\n'; return 1; }
+  )
+}
+
+s17() {
+  (
+    c11_arm_oss_env
+    export M8_OSSUTIL_VERSION='2.4.0'
+    export M8_OSSUTIL_BINARY_SHA256="$(sha256sum "$FAKE_OSSUTIL" | cut -d' ' -f1)"
+    local digest zero='0000000000000000000000000000000000000000000000000000000000000000'
+    digest="$(m8_oss_trust_profile_sha256)"
+    [[ "$(M8_OSS_BUCKET='test-bucket-two' m8_oss_trust_profile_sha256)" != "$digest" ]] ||
+      { printf 'S17: bucket change did not move the digest\n'; return 1; }
+    [[ "$(M8_OSS_ECS_ROLE_NAME='SomeOtherRole' m8_oss_trust_profile_sha256)" != "$digest" ]] ||
+      { printf 'S17: observed role change did not move the digest\n'; return 1; }
+    [[ "$(M8_OSSUTIL_VERSION='2.4.1' m8_oss_trust_profile_sha256)" != "$digest" ]] ||
+      { printf 'S17: ossutil version change did not move the digest\n'; return 1; }
+    [[ "$(M8_OSSUTIL_BINARY_SHA256="$zero" m8_oss_trust_profile_sha256)" != "$digest" ]] ||
+      { printf 'S17: ossutil binary change did not move the digest\n'; return 1; }
+  )
+}
+
+s18() {
+  (
+    c11_arm_oss_env
+    local rc=0
+    ( M8_OSS_ECS_ROLE_NAME='LinguaGraphM8ProofExecutor-OTHER' m8_oss_api get-bucket-location --bucket test-bucket ) \
+      >/dev/null 2>&1 || rc=$?
+    assert_eq "$rc" '1' 'S18: a mismatched role cannot reach ossutil'
+    assert_eq "$(wc -l <"$M8_FAKE_OSS_MUTATION_LOG" | tr -d '[:space:]')" '0' 'S18: no synthetic OSS operation ran'
+    assert_eq "$(wc -l <"$M8_FAKE_OSS_ARG_LOG" | tr -d '[:space:]')" '0' 'S18: no CLI vector was ever issued'
+  )
+}
+
+# ===========================================================================
+# R2I-C12 — versioning-response classifier correction regressions (X01..X27).
+#
+# The exact live ossutil 2.4.0 response on the bound ECS is
+#   <VersioningConfiguration xmlns="http://doc.oss-cn-hangzhou.aliyuncs.com"/>
+#   0.087913(s) elapsed
+# i.e. 94 bytes / SHA-256
+# 68b07ea885b0284072d2ed8c29181aaa049a7f6c86034ef508fa0d277a9a5dd4.
+# The pre-C12 regex fullmatch classifier rejected that legitimate response as
+# "unparseable". These regressions drive the REAL production guard over the new
+# structured (xml.etree.ElementTree) classifier.
+# ===========================================================================
+
+readonly C12_LIVE_RESPONSE_BYTES='94'
+readonly C12_LIVE_RESPONSE_SHA='68b07ea885b0284072d2ed8c29181aaa049a7f6c86034ef508fa0d277a9a5dd4'
+readonly C12_OFFICIAL_NS='http://doc.oss-cn-hangzhou.aliyuncs.com'
+readonly C12_UNPARSEABLE_LINE='bucket_versioning=REJECTED:unparseable versioning response'
+
+# Arm a complete synthetic OSS environment for the C12 regressions.
+c12_arm_env() {
+  # shellcheck source=/dev/null
+  source "$OSS_LIB"
+  c11_arm_provider_seams
+  export M8_PROOF_ROOT="$REPO_ROOT"
+  export M8_OSS_BUCKET='test-bucket'
+  export M8_OSSUTIL_BIN="$FAKE_OSSUTIL"
+  export M8_FAKE_OSS_ROOT="$TMPROOT/c12-oss"
+  export M8_FAKE_OSS_LOCATION='cn-hongkong'
+  export M8_FAKE_OSS_VERSIONING='unversioned'
+  export M8_FAKE_OSS_MUTATION_LOG="$TMPROOT/c12-mut.log"
+  mkdir -p "$M8_FAKE_OSS_ROOT"
+  : >"$M8_FAKE_OSS_MUTATION_LOG"
+}
+
+# Drive the REAL production versioning guard over one synthetic fixture state and
+# report its rc, its op accounting and the recorded pre-claim evidence file.
+c12_guard() { # state
+  local state=$1
+  (
+    c12_arm_env
+    export M8_FAKE_OSS_VERSIONING="$state"
+    local evidence="$TMPROOT/c12-evidence"
+    rm -rf "$evidence"
+    mkdir -p "$evidence"
+    local rc=0
+    m8_oss_versioning_guard "$evidence" || rc=$?
+    printf 'guard_rc=%s\n' "$rc"
+    printf 'write_count=%s\n' "$(grep -c '^WRITE' "$M8_FAKE_OSS_MUTATION_LOG" || true)"
+    printf 'read_count=%s\n' "$(grep -c '^READ get-bucket-versioning' "$M8_FAKE_OSS_MUTATION_LOG" || true)"
+    printf '%s\n' '--- evidence ---'
+    cat "$evidence/oss-versioning-guard.txt" 2>/dev/null || true
+  )
+}
+
+# Drive the REAL production guard with an arbitrary raw payload through a scratch
+# CLI stub, for payload shapes the fixture state table does not carry.
+c12_guard_raw() { # payload-file
+  local payload=$1
+  (
+    c12_arm_env
+    local stub="$TMPROOT/c12-raw-stub"
+    cat >"$stub" <<EOF
+#!/usr/bin/env bash
+cat "$payload"
+EOF
+    chmod +x "$stub"
+    export M8_OSSUTIL_BIN="$stub"
+    export M8_FAKE_OSS_MUTATION_LOG="$TMPROOT/c12-raw-mut.log"
+    : >"$M8_FAKE_OSS_MUTATION_LOG"
+    local evidence="$TMPROOT/c12-raw-evidence"
+    rm -rf "$evidence"
+    mkdir -p "$evidence"
+    local rc=0
+    m8_oss_versioning_guard "$evidence" || rc=$?
+    printf 'guard_rc=%s\n' "$rc"
+    printf 'write_count=%s\n' "$(grep -c '^WRITE' "$M8_FAKE_OSS_MUTATION_LOG" || true)"
+    printf '%s\n' '--- evidence ---'
+    cat "$evidence/oss-versioning-guard.txt" 2>/dev/null || true
+  )
+}
+
+c12_field() { sed -n "s/^$2=//p" <<<"$1"; }
+
+# The fixture state must be ELIGIBLE: guard rc 0, one read, no write.
+c12_assert_eligible() { # state
+  local state=$1 res
+  res="$(c12_guard "$state")"
+  assert_eq "$(c12_field "$res" guard_rc)" '0' "state $state must be eligible"
+  assert_eq "$(c12_field "$res" write_count)" '0' "state $state must not write"
+  assert_eq "$(c12_field "$res" read_count)" '1' "state $state must issue exactly one read"
+  grep -qxF 'bucket_versioning=UNVERSIONED' <<<"$res" ||
+    assert_fail "state $state did not record bucket_versioning=UNVERSIONED"
+  return 0
+}
+
+# The fixture state must FAIL CLOSED: guard rc non-zero, no write, and optionally
+# an exact evidence classification line.
+c12_assert_rejected() { # state [expected_evidence_line]
+  local state=$1 expected=${2:-} res
+  res="$(c12_guard "$state")"
+  [[ "$(c12_field "$res" guard_rc)" != '0' ]] ||
+    assert_fail "state $state was accepted by the production guard"
+  assert_eq "$(c12_field "$res" write_count)" '0' "state $state must not write"
+  assert_eq "$(c12_field "$res" read_count)" '1' "state $state must issue exactly one read"
+  if [[ -n "$expected" ]]; then
+    grep -qxF "$expected" <<<"$res" || assert_fail "state $state evidence lacked: $expected"
+  fi
+  return 0
+}
+
+x01() {
+  # The exact captured-live regression: the synthetic raw response must be
+  # byte-identical to the live capture, and the REAL guard must accept it.
+  (
+    c12_arm_env
+    local raw stripped
+    raw="$(M8_FAKE_OSS_VERSIONING='live_namespace_timing' "$FAKE_OSSUTIL" \
+      api get-bucket-versioning --bucket test-bucket)" || return 1
+    stripped="$TMPROOT/c12-exact-response.bin"
+    printf '%s' "$raw" >"$stripped"
+    assert_eq "$(wc -c <"$stripped" | tr -d '[:space:]')" "$C12_LIVE_RESPONSE_BYTES" \
+      'exact live response byte count'
+    assert_eq "$(sha256sum "$stripped" | cut -d' ' -f1)" "$C12_LIVE_RESPONSE_SHA" \
+      'exact live response digest'
+
+    local res
+    res="$(c12_guard live_namespace_timing)"
+    assert_eq "$(c12_field "$res" guard_rc)" '0' 'the exact live response must be eligible'
+    assert_eq "$(c12_field "$res" write_count)" '0' 'the exact live response must not write'
+    assert_eq "$(c12_field "$res" read_count)" '1' 'the exact live response must issue one read'
+    grep -qxF 'bucket_versioning=UNVERSIONED' <<<"$res" ||
+      assert_fail 'the exact live response did not record UNVERSIONED'
+    assert_contains <(printf '%s\n' "$res") 'get_bucket_versioning_rc=0'
+    assert_contains <(printf '%s\n' "$res") "<VersioningConfiguration xmlns=\"$C12_OFFICIAL_NS\"/>"
+    assert_contains <(printf '%s\n' "$res") '0.087913(s) elapsed'
+    return 0
+  )
+}
+
+x02() {
+  # Structural positives: no Status at all (both namespace forms), Null status,
+  # and the historically empty successful response.
+  local state
+  for state in namespace_empty no_namespace_empty null unversioned; do
+    c12_assert_eligible "$state" || return 1
+  done
+  return 0
+}
+
+x03() {
+  c12_assert_rejected enabled 'bucket_versioning=REJECTED:versioning Enabled' || return 1
+  return 0
+}
+
+x04() {
+  c12_assert_rejected suspended 'bucket_versioning=REJECTED:versioning Suspended' || return 1
+  return 0
+}
+
+x05() {
+  # A non-zero query RC is still an outright rejection (never a classification).
+  c12_assert_rejected denied || return 1
+  return 0
+}
+
+x06() {
+  c12_assert_rejected unknown_namespace "$C12_UNPARSEABLE_LINE" || return 1
+  return 0
+}
+
+x07() {
+  c12_assert_rejected unexpected_child "$C12_UNPARSEABLE_LINE" || return 1
+  return 0
+}
+
+x08() {
+  c12_assert_rejected duplicate_status "$C12_UNPARSEABLE_LINE" || return 1
+  return 0
+}
+
+x09() {
+  c12_assert_rejected nested_status "$C12_UNPARSEABLE_LINE" || return 1
+  return 0
+}
+
+x10() {
+  c12_assert_rejected root_attribute "$C12_UNPARSEABLE_LINE" || return 1
+  return 0
+}
+
+x11() {
+  c12_assert_rejected wrong_root "$C12_UNPARSEABLE_LINE" || return 1
+  return 0
+}
+
+x12() {
+  c12_assert_rejected malformed_xml "$C12_UNPARSEABLE_LINE" || return 1
+  return 0
+}
+
+x13() {
+  c12_assert_rejected doctype "$C12_UNPARSEABLE_LINE" || return 1
+  return 0
+}
+
+x14() {
+  c12_assert_rejected entity "$C12_UNPARSEABLE_LINE" || return 1
+  return 0
+}
+
+x15() {
+  c12_assert_rejected trailing_garbage "$C12_UNPARSEABLE_LINE" || return 1
+  return 0
+}
+
+x16() {
+  c12_assert_rejected double_timing_footer "$C12_UNPARSEABLE_LINE" || return 1
+  return 0
+}
+
+x17() {
+  # Only absent / empty / Null may mean UNVERSIONED. Unknown statuses fail closed
+  # with the precise UNKNOWN diagnostic, and the historical "unversioned"/"none"
+  # magic aliases and blanket case folding are gone.
+  c12_assert_rejected unknown_status \
+    'bucket_versioning=REJECTED:unknown versioning status '"'"'Bogus'"'"'' || return 1
+  local payload got
+  for payload in '{"Status": "unversioned"}' '{"Status": "none"}' \
+    '<VersioningConfiguration><Status>unversioned</Status></VersioningConfiguration>' \
+    '<VersioningConfiguration><Status>none</Status></VersioningConfiguration>' \
+    '<VersioningConfiguration><Status>enabled</Status></VersioningConfiguration>'; do
+    printf '%s' "$payload" >"$TMPROOT/c12-x17-payload"
+    got="$(c12_guard_raw "$TMPROOT/c12-x17-payload")"
+    [[ "$(c12_field "$got" guard_rc)" != '0' ]] ||
+      assert_fail "magic/aliased status was accepted: $payload"
+    assert_eq "$(c12_field "$got" write_count)" '0' "aliased status must not write: $payload"
+  done
+  return 0
+}
+
+x18() {
+  # Payload shapes beyond the fixture state table, driven through the REAL guard
+  # via a scratch CLI stub: multiple documents, stray root text, child tail,
+  # Status attributes, Status in an inconsistent namespace, an embedded (not
+  # terminal) footer, a non-conforming footer, real invalid UTF-8, and the
+  # legacy unparseable text state.
+  (
+    c12_arm_env
+    local payload="$TMPROOT/c12-x18-payload" res
+    printf '%s' '<VersioningConfiguration/><VersioningConfiguration/>' >"$payload"
+    res="$(c12_guard_raw "$payload")"
+    [[ "$(c12_field "$res" guard_rc)" != '0' ]] || assert_fail 'multiple XML documents were accepted'
+    assert_eq "$(c12_field "$res" write_count)" '0' 'multiple documents must not write'
+
+    printf '%s' '<VersioningConfiguration>x<Status>Null</Status></VersioningConfiguration>' >"$payload"
+    res="$(c12_guard_raw "$payload")"
+    [[ "$(c12_field "$res" guard_rc)" != '0' ]] || assert_fail 'non-whitespace root text was accepted'
+
+    printf '%s' '<VersioningConfiguration><Status>Null</Status>tail</VersioningConfiguration>' >"$payload"
+    res="$(c12_guard_raw "$payload")"
+    [[ "$(c12_field "$res" guard_rc)" != '0' ]] || assert_fail 'a non-whitespace child tail was accepted'
+
+    printf '%s' '<VersioningConfiguration><Status foo="1">Null</Status></VersioningConfiguration>' >"$payload"
+    res="$(c12_guard_raw "$payload")"
+    [[ "$(c12_field "$res" guard_rc)" != '0' ]] || assert_fail 'Status with an attribute was accepted'
+
+    printf '<VersioningConfiguration xmlns="%s"><Status xmlns="">Null</Status></VersioningConfiguration>' \
+      "$C12_OFFICIAL_NS" >"$payload"
+    res="$(c12_guard_raw "$payload")"
+    [[ "$(c12_field "$res" guard_rc)" != '0' ]] ||
+      assert_fail 'Status in a namespace inconsistent with the root was accepted'
+
+    printf '<VersioningConfiguration xmlns="%s"><Status>Null</Status></VersioningConfiguration>' \
+      "$C12_OFFICIAL_NS" >"$payload"
+    res="$(c12_guard_raw "$payload")"
+    assert_eq "$(c12_field "$res" guard_rc)" '0' 'official-namespace Status must be eligible'
+
+    # A footer embedded BEFORE further text is not a terminal footer.
+    printf '%s' '0.087913(s) elapsed
+<VersioningConfiguration/>' >"$payload"
+    res="$(c12_guard_raw "$payload")"
+    [[ "$(c12_field "$res" guard_rc)" != '0' ]] || assert_fail 'an embedded timing footer was accepted'
+
+    # The footer grammar is frozen: "(s) elapsed" is literal.
+    printf '%s' '<VersioningConfiguration/>
+0.087913 elapsed' >"$payload"
+    res="$(c12_guard_raw "$payload")"
+    [[ "$(c12_field "$res" guard_rc)" != '0' ]] || assert_fail 'a non-conforming footer was accepted'
+
+    # A real invalid UTF-8 byte must fail closed, never be silently normalised.
+    printf '<VersioningConfiguration\xff/>' >"$payload"
+    res="$(c12_guard_raw "$payload")"
+    [[ "$(c12_field "$res" guard_rc)" != '0' ]] || assert_fail 'invalid UTF-8 was accepted'
+
+    # Legacy unparseable text state remains rejected.
+    c12_assert_rejected garbage "$C12_UNPARSEABLE_LINE" || return 1
+    return 0
+  )
+}
+
+x19() {
+  # Static: the XML branch is STRUCTURED, not regex, and never normalises bytes.
+  local body="$TMPROOT/c12-guard-body"
+  sed -n '/^m8_oss_versioning_guard()/,/^}/p' "$OSS_LIB" >"$body"
+  assert_file "$body"
+  assert_contains "$body" 'import xml.etree.ElementTree as ET'
+  assert_contains "$body" 'ET.XMLParser(target=builder)'
+  assert_contains "$body" 'OFFICIAL_NS = "http://doc.oss-cn-hangzhou.aliyuncs.com"'
+  assert_contains "$body" '"<!doctype" in lowered'
+  assert_contains "$body" '"<!entity" in lowered'
+  assert_contains "$body" 'TIMING_FOOTER.fullmatch'
+  assert_contains "$body" 'data.decode("utf-8")'
+  # The pre-C12 broad-regex XML classification is gone...
+  assert_no_contains "$body" '(?is)(<\?xml'
+  assert_no_contains "$body" '<VersioningConfiguration\s*/>'
+  assert_no_contains "$body" '<VersioningConfiguration>\s*</VersioningConfiguration>'
+  assert_no_contains "$body" '<Status>\s*([^<]*?)\s*</Status>'
+  # ...and the response is never read with lossy decoding.
+  assert_no_contains "$body" 'errors="replace"'
+  return 0
+}
+
+x20() {
+  # F05: a malformed XML declaration must not be repaired before parsing.
+  c12_assert_rejected xml_decl_garbage "$C12_UNPARSEABLE_LINE" || return 1
+  c12_assert_rejected xml_decl_attribute "$C12_UNPARSEABLE_LINE" || return 1
+  return 0
+}
+
+x21() {
+  # A valid ordinary XML declaration is validated by the XML parser itself.
+  c12_assert_eligible xml_decl_valid || return 1
+  return 0
+}
+
+x22() {
+  # F06: comments / processing instructions inside the root are not "empty".
+  c12_assert_rejected comment_child "$C12_UNPARSEABLE_LINE" || return 1
+  c12_assert_rejected pi_child "$C12_UNPARSEABLE_LINE" || return 1
+  return 0
+}
+
+x23() {
+  # Comments / PIs at document level before and after the root are dropped
+  # silently by the default TreeBuilder, so they must be rejected explicitly.
+  c12_assert_rejected outer_comment_before "$C12_UNPARSEABLE_LINE" || return 1
+  c12_assert_rejected outer_comment_after "$C12_UNPARSEABLE_LINE" || return 1
+  c12_assert_rejected outer_pi_before "$C12_UNPARSEABLE_LINE" || return 1
+  c12_assert_rejected outer_pi_after "$C12_UNPARSEABLE_LINE" || return 1
+  return 0
+}
+
+x24() {
+  # F07: the footer line must match the frozen grammar EXACTLY, while an exact
+  # footer (and the exact captured-live response) stay eligible.
+  c12_assert_rejected footer_leading_space "$C12_UNPARSEABLE_LINE" || return 1
+  c12_assert_rejected footer_trailing_space "$C12_UNPARSEABLE_LINE" || return 1
+  c12_assert_eligible exact_footer || return 1
+  c12_assert_eligible live_namespace_timing || return 1
+  return 0
+}
+
+x25() {
+  # A declaration that is not at the very start of the document stays malformed
+  # (no trimming may rescue it), while leading whitespace before a plain root
+  # element follows ordinary XML parser semantics.
+  c12_assert_rejected misplaced_declaration "$C12_UNPARSEABLE_LINE" || return 1
+  c12_assert_eligible leading_ws_root || return 1
+  return 0
+}
+
+x26() {
+  # Document-level shapes the fixture state table does not carry, driven through
+  # the REAL guard: comment-only, PI-only, a comment inside Status, and a valid
+  # declaration carrying an encoding attribute.
+  (
+    c12_arm_env
+    local payload="$TMPROOT/c12-x26-payload" res
+    printf '%s' '<!--c-->' >"$payload"
+    res="$(c12_guard_raw "$payload")"
+    [[ "$(c12_field "$res" guard_rc)" != '0' ]] || assert_fail 'a comment-only document was accepted'
+    assert_eq "$(c12_field "$res" write_count)" '0' 'a comment-only document must not write'
+
+    printf '%s' '<?pi x?>' >"$payload"
+    res="$(c12_guard_raw "$payload")"
+    [[ "$(c12_field "$res" guard_rc)" != '0' ]] || assert_fail 'a PI-only document was accepted'
+
+    printf '%s' '<VersioningConfiguration><Status><!--c-->Null</Status></VersioningConfiguration>' >"$payload"
+    res="$(c12_guard_raw "$payload")"
+    [[ "$(c12_field "$res" guard_rc)" != '0' ]] || assert_fail 'a comment inside Status was accepted'
+
+    printf '%s' '<?xml version="1.0" encoding="UTF-8"?><VersioningConfiguration/>' >"$payload"
+    res="$(c12_guard_raw "$payload")"
+    assert_eq "$(c12_field "$res" guard_rc)" '0' 'a valid encoding declaration must be eligible'
+    return 0
+  )
+}
+
+x27() {
+  # Static C12-A1 proof: no prolog pre-processing, observable comments/PIs, no
+  # blanket strip of the parsed payload, and an exact footer match.
+  local body="$TMPROOT/c12a1-guard-body"
+  sed -n '/^m8_oss_versioning_guard()/,/^}/p' "$OSS_LIB" >"$body"
+  assert_file "$body"
+  assert_no_contains "$body" 'XML_PROLOG'
+  assert_no_contains "$body" 'prolog ='
+  assert_no_contains "$body" 'xml_text'
+  assert_contains "$body" 'insert_comments=True'
+  assert_contains "$body" 'insert_pis=True'
+  assert_contains "$body" 'ET.XMLParser(target=builder)'
+  assert_contains "$body" 'parser.feed(body)'
+  assert_contains "$body" 'parser.close()'
+  assert_contains "$body" 'builder.non_element_nodes > 0'
+  assert_contains "$body" 'body = "\n".join(lines)'
+  assert_no_contains "$body" 'body = "\n".join(lines).strip()'
+  assert_contains "$body" 'TIMING_FOOTER.fullmatch(lines[-1])'
+  assert_no_contains "$body" 'TIMING_FOOTER.fullmatch(lines[-1].strip())'
+  return 0
+}
+
+# ===========================================================================
 printf '===== M8-HSDR-F02 R2E-B01 + R2I-C1 offline verification =====\n'
 printf 'repo=%s\n' "$REPO_ROOT"
 
@@ -3318,7 +4088,7 @@ run_check r2i I02 'M8_PYTHON_BIN rejected fail-closed by both entrypoints' i02
 printf '\n----- R2I-C4/B03 trust-target regressions (T01..T12) -----\n'
 run_check r2i_c4 T01 'closed 19-name OSS trust environment, separate from the 7 C1 seams' t01
 run_check r2i_c4 T02 'every API call is issued through the exact frozen CLI trust target' t02
-run_check r2i_c4 T03 'canonical proof-tree inert config identity and fail-closed mutation' t03
+run_check r2i_c4 T03 'canonical proof-tree role-bound config identity and fail-closed mutation' t03
 run_check r2i_c4 T04 'ossutil path/version/binary identity with a 2.2.0 minimum' t04
 run_check r2i_c4 T05 'bucket-location guard rejects non-canonical locations before any write' t05
 run_check r2i_c4 T06 'read-only single role-name observation; credential payload never requested' t06
@@ -3335,6 +4105,55 @@ run_check r2i_c7 P02 'identity document and PKCS7 NUL bodies fail before digest 
 run_check r2i_c7 P03 'preflight uses the shared byte-safe authority for immutable inputs' p03
 run_check r2i_c7 P04 'clean provider semantics and canonical digests match the pre-C7 oracle' p04
 
+printf '\n----- R2I-C11 auth-path correction regressions (S01..S18) -----\n'
+run_check r2i_c11 S01 'canonical config is exactly 81 bytes' s01
+run_check r2i_c11 S02 'canonical config SHA-256 is the frozen value' s02
+run_check r2i_c11 S03 'canonical config semantic content is exact' s03
+run_check r2i_c11 S04 'production CLI vector contains the five frozen pins' s04
+run_check r2i_c11 S05 'production CLI vector has no --mode and no --ecs-role-name' s05
+run_check r2i_c11 S06 'synthetic help does not advertise --ecs-role-name' s06
+run_check r2i_c11 S07 'synthetic ossutil models the exact 2.4.0 CLI mode set; rejects --ecs-role-name, Ali-EcsRamRole, RamRoleArn' s07
+run_check r2i_c11 S08 'missing stored observed role fails closed before OSS' s08
+run_check r2i_c11 S09 'stored role disagreeing with the config fails closed' s09
+run_check r2i_c11 S10 'fresh live role disagreeing with stored/config fails closed' s10
+run_check r2i_c11 S11 'missing durable provider helper fails closed' s11
+run_check r2i_c11 S12 'triple-equal role binding permits the synthetic OSS call' s12
+run_check r2i_c11 S13 'auth mode constant is Ali-EcsRamRole' s13
+run_check r2i_c11 S14 'config policy id and 81-byte identity constants' s14
+run_check r2i_c11 S15 'trust profile stays 18 records with exact LF semantics' s15
+run_check r2i_c11 S16 'trust profile records the new auth mode / config identity' s16
+run_check r2i_c11 S17 'trust-profile digest is sensitive to bucket, role, version, binary' s17
+run_check r2i_c11 S18 'a mismatched role cannot produce an eligible network path' s18
+
+printf '\n----- R2I-C12 versioning classifier correction regressions (X01..X27) -----\n'
+run_check r2i_c12 X01 'exact live 94-byte XML+timing capture is eligible via the structured classifier' x01
+run_check r2i_c12 X02 'structural positives: no Status (both namespaces), Null, empty response' x02
+run_check r2i_c12 X03 'versioning Enabled is rejected' x03
+run_check r2i_c12 X04 'versioning Suspended is rejected' x04
+run_check r2i_c12 X05 'a non-zero versioning query RC is rejected' x05
+run_check r2i_c12 X06 'an unknown XML namespace is rejected' x06
+run_check r2i_c12 X07 'an unexpected child is rejected' x07
+run_check r2i_c12 X08 'a duplicate Status is rejected' x08
+run_check r2i_c12 X09 'a nested Status is rejected' x09
+run_check r2i_c12 X10 'an unexpected root attribute is rejected' x10
+run_check r2i_c12 X11 'a wrong root element is rejected' x11
+run_check r2i_c12 X12 'malformed XML is rejected' x12
+run_check r2i_c12 X13 'DOCTYPE is rejected' x13
+run_check r2i_c12 X14 'ENTITY is rejected' x14
+run_check r2i_c12 X15 'unknown trailing text is rejected' x15
+run_check r2i_c12 X16 'a double timing footer is rejected' x16
+run_check r2i_c12 X17 'unknown/aliased/lower-cased Status values fail closed' x17
+run_check r2i_c12 X18 'stray text, tails, attributes, bad footer grammar and invalid UTF-8 fail closed' x18
+run_check r2i_c12 X19 'the XML branch is structured ElementTree parsing, never broad regex' x19
+run_check r2i_c12 X20 'a malformed XML declaration is rejected, never repaired' x20
+run_check r2i_c12 X21 'a valid XML declaration is validated by the XML parser and accepted' x21
+run_check r2i_c12 X22 'a comment or processing-instruction child is rejected' x22
+run_check r2i_c12 X23 'document-level comments/PIs around the root are rejected' x23
+run_check r2i_c12 X24 'the timing footer must match the frozen grammar exactly' x24
+run_check r2i_c12 X25 'a misplaced declaration is rejected; leading whitespace follows parser semantics' x25
+run_check r2i_c12 X26 'comment-only/PI-only documents and an encoding declaration are classified correctly' x26
+run_check r2i_c12 X27 'no prolog pre-processing, observable comments/PIs, exact footer match' x27
+
 printf '\n===== summary =====\n'
 printf 'R2E_B01_LEGACY_V01_V40=%s/%s\n' \
   "$((STATIC_PASS + SYNTH_PASS))" "$((STATIC_TOTAL + SYNTH_TOTAL))"
@@ -3344,6 +4163,8 @@ printf 'R2E_B01_SYNTHETIC_CHECKS=%s/%s\n' "$SYNTH_PASS" "$SYNTH_TOTAL"
 printf 'R2I_C1_REGRESSIONS=%s/%s\n' "$R2I_PASS" "$R2I_TOTAL"
 printf 'R2I_C4_B03_REGRESSIONS=%s/%s\n' "$R2I_C4_PASS" "$R2I_C4_TOTAL"
 printf 'R2I_C7_PROVIDER_BINARY_REGRESSIONS=%s/%s\n' "$R2I_C7_PASS" "$R2I_C7_TOTAL"
+printf 'R2I_C11_AUTH_PATH_REGRESSIONS=%s/%s\n' "$R2I_C11_PASS" "$R2I_C11_TOTAL"
+printf 'R2I_C12_VERSIONING_CLASSIFIER_REGRESSIONS=%s/%s\n' "$R2I_C12_PASS" "$R2I_C12_TOTAL"
 if ((${#FAILED_CHECKS[@]})); then
   printf 'R2E_B01_OFFLINE_VERIFICATION=FAIL failed=%s\n' "${FAILED_CHECKS[*]}"
   exit 1

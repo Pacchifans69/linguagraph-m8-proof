@@ -6,12 +6,20 @@
 #   * official `ossutil api <operation>` commands ONLY;
 #   * no custom OSS request signing, no Alibaba OSS SDK dependency;
 #   * the proof harness NEVER installs ossutil (host provisioning supplies it);
-#   * every network-capable invocation carries the CLI-pinned trust target:
-#     --config-file <proof-tree inert config>  --region cn-hongkong
+#   * every network-capable invocation carries the five CLI-pinned global flags:
+#     --config-file <proof-tree IMDSv2 role-bound config>  --region cn-hongkong
 #     --endpoint https://oss-cn-hongkong-internal.aliyuncs.com
-#     --mode EcsRamRole  --ecs-role-name <observed live role>
 #     --addressing-style virtual  --ignore-env-var
+#     There is NO CLI --mode and NO CLI --ecs-role-name: ossutil 2.4.0 rejects
+#     "unknown flag: --ecs-role-name" and refuses Ali-EcsRamRole via CLI --mode.
+#     The ECS role binding lives in the proof-tree canonical config and is
+#     cross-bound against a FRESH IMDSv2 role-name observation (durable provider
+#     helper) before every network-capable call;
 #     never --skip-verify-cert, never AK/STS/RamRoleArn credential flags;
+#   * the official ossutil Ali-EcsRamRole credential provider MAY internally
+#     retrieve temporary credentials through IMDSv2. Our harness never prints,
+#     persists or places those credential values in evidence, and never supplies
+#     AK/SK/STS credential flags;
 #   * ambient config selection is impossible: M8_OSSUTIL_CONFIG_FILE is rejected
 #     by the closed trust-environment guard and is never consumed here, and the
 #     default ~/.ossutilconfig is never relied upon;
@@ -50,15 +58,19 @@ readonly M8_OSS_ENDPOINT='https://oss-cn-hongkong-internal.aliyuncs.com'
 readonly M8_OSS_ENDPOINT_CLASS='INTERNAL'
 readonly M8_OSS_NETWORK_POLICY='SAME_REGION_INTERNAL_ONLY'
 readonly M8_OSS_ADDRESSING_STYLE='virtual'
-readonly M8_OSS_AUTH_MODE='EcsRamRole'
+# R2I-C11: the CLI --mode / --ecs-role-name flags are NOT supported by ossutil
+# 2.4.0 (live: "unknown flag: --ecs-role-name" and CLI --mode rejects
+# Ali-EcsRamRole). The role binding therefore lives in the proof-tree canonical
+# config and is cross-bound against a fresh IMDSv2 role-name observation.
+readonly M8_OSS_AUTH_MODE='Ali-EcsRamRole'
 readonly M8_OSS_TLS_VERIFICATION='required'
 readonly M8_OSS_CONFIG_RELPATH='scripts/config/m8-ossutil-formal.ini'
 readonly M8_OSS_CONFIG_PROFILE='default'
-readonly M8_OSS_CONFIG_POLICY_ID='m8-proof-tree-inert-config/v1'
+readonly M8_OSS_CONFIG_POLICY_ID='m8-proof-tree-imdsv2-role-config/v1'
 readonly M8_OSS_ENV_POLICY_ID='m8-oss-env-closed/v1'
 readonly M8_OSS_IGNORE_ENV_VARS='true'
-readonly M8_OSS_CONFIG_SHA256='76e66fda3cb1279873039930dcf15834f56067434423781dbdd94d84de5a011e'
-readonly M8_OSS_CONFIG_BYTES='22'
+readonly M8_OSS_CONFIG_SHA256='43b384710e4d0944fa3fea3f4daf4dcaba280739cc40d9c31bdbd6c54772c47a'
+readonly M8_OSS_CONFIG_BYTES='81'
 readonly M8_OSS_MIN_VERSION='2.2.0'
 readonly M8_OSS_BUCKET_LOCATION='oss-cn-hongkong'
 
@@ -89,7 +101,7 @@ m8_oss_require_config() {
   return 0
 }
 
-# --- canonical proof-tree inert configuration identity ----------------------
+# --- canonical proof-tree IMDSv2 role-bound configuration identity ----------
 m8_oss_proof_root() {
   local root=${M8_PROOF_ROOT:-}
   [[ -n "$root" ]] || { m8_oss_die 'M8_PROOF_ROOT is not set; cannot resolve the canonical OSS config'; return 1; }
@@ -105,6 +117,10 @@ m8_oss_canonical_config_path() {
 # Fail closed unless the canonical proof-tree config is an exact, regular,
 # in-worktree file with the reviewed byte identity. There is no fallback to
 # ~/.ossutilconfig, OSSUTIL_CONFIG_FILE or any caller-selected profile.
+#
+# R2I-C11: the config is no longer "inert" -- it carries the role binding that
+# the ossutil 2.4.0 CLI cannot express as a flag. The guard therefore also
+# establishes and exposes the canonical auth mode and role name.
 m8_oss_canonical_config_guard() {
   local root config size sha
   root=$(m8_oss_proof_root) || return 1
@@ -126,11 +142,82 @@ m8_oss_canonical_config_guard() {
   [[ "$sha" == "$M8_OSS_CONFIG_SHA256" ]] ||
     { m8_oss_die "canonical OSS config SHA-256 mismatch (expected $M8_OSS_CONFIG_SHA256; got $sha)"; return 1; }
 
-  # The config is inert: it must declare nothing but the language key.
-  local body
-  body=$(grep -vE '^[[:space:]]*(#|$)' "$config" | sort | tr '\n' ' ')
-  [[ "$body" == "[default] language=EN " ]] ||
-    { m8_oss_die 'canonical OSS config contains unexpected keys'; return 1; }
+  # Exact semantic content: profile header plus the language, mode and role keys.
+  # No other key, no comment, no blank record is tolerated.
+  local body role_now
+  role_now=$(m8_oss_config_role_name) || return 1
+  body=$(grep -vE '^[[:space:]]*(#|$)' "$config")
+  [[ "$body" == "$(printf '[default]\nlanguage=EN\nmode=%s\necsRoleName=%s' "$M8_OSS_AUTH_MODE" "$role_now")" ]] ||
+    { m8_oss_die 'canonical OSS config contains unexpected or missing keys'; return 1; }
+  [[ "$(grep -c '^' <<<"$body")" == '4' ]] ||
+    { m8_oss_die 'canonical OSS config must contain exactly four records'; return 1; }
+
+  M8_OSS_CONFIG_AUTH_MODE=$(m8_oss_config_auth_mode) || return 1
+  M8_OSS_CONFIG_ROLE_NAME=$role_now
+  [[ "$M8_OSS_CONFIG_AUTH_MODE" == "$M8_OSS_AUTH_MODE" ]] ||
+    { m8_oss_die "canonical config auth mode '$M8_OSS_CONFIG_AUTH_MODE' does not match the frozen '$M8_OSS_AUTH_MODE'"; return 1; }
+  [[ -n "$M8_OSS_CONFIG_ROLE_NAME" ]] ||
+    { m8_oss_die 'canonical config does not establish an ECS role name'; return 1; }
+  export M8_OSS_CONFIG_AUTH_MODE M8_OSS_CONFIG_ROLE_NAME
+  return 0
+}
+
+# --- canonical config bindings (single source of truth = frozen config bytes) -
+m8_oss_config_auth_mode() {
+  local config
+  config=$(m8_oss_canonical_config_path) || return 1
+  sed -n 's/^mode=//p' "$config" | head -n1
+}
+
+m8_oss_config_role_name() {
+  local config
+  config=$(m8_oss_canonical_config_path) || return 1
+  sed -n 's/^ecsRoleName=//p' "$config" | head -n1
+}
+
+# --- role cross-binding -----------------------------------------------------
+# A. stored/config binding: purely local, no provider access. The stored
+#    observed role must equal the proof-tree config role, and the config auth
+#    mode must equal the frozen auth mode.
+m8_oss_role_binding_guard() {
+  local observed config_role config_mode
+  m8_oss_canonical_config_guard || return 1
+  observed=$(m8_oss_ecs_role_name)
+  [[ -n "$observed" ]] ||
+    { m8_oss_die 'observed ECS RAM role name is not established; refusing any OSS call'; return 1; }
+  config_role=$(m8_oss_config_role_name) || return 1
+  [[ -n "$config_role" ]] ||
+    { m8_oss_die 'proof-tree config does not establish an ECS role name'; return 1; }
+  config_mode=$(m8_oss_config_auth_mode) || return 1
+  [[ "$config_mode" == "$M8_OSS_AUTH_MODE" ]] ||
+    { m8_oss_die "proof-tree config auth mode '$config_mode' is not '$M8_OSS_AUTH_MODE'"; return 1; }
+  [[ "$observed" == "$config_role" ]] ||
+    { m8_oss_die "stored observed ECS role '$observed' does not match the proof-tree config role '$config_role'"; return 1; }
+  return 0
+}
+
+# B. fresh live cross-binding: required before EVERY network-capable invocation.
+#    The durable IMDSv2 provider helper must be available (no fallback to the
+#    stored value) and its fresh role-name LIST observation must equal both the
+#    stored observed role and the proof-tree config role.
+m8_oss_live_role_cross_binding_guard() {
+  local live stored
+  m8_oss_role_binding_guard || return 1
+  declare -F m8_provider_identity_observe_ecs_role_name >/dev/null 2>&1 ||
+    { m8_oss_die 'durable IMDSv2 provider role helper is unavailable; refusing any OSS network call'; return 1; }
+  stored=$(m8_oss_ecs_role_name)
+  live=$(m8_provider_identity_observe_ecs_role_name) || {
+    m8_oss_die 'fresh IMDSv2 role-name observation failed; refusing any OSS network call'
+    return 1
+  }
+  [[ -n "$live" ]] ||
+    { m8_oss_die 'fresh IMDSv2 role-name observation was empty; refusing any OSS network call'; return 1; }
+  [[ "$live" == "$stored" ]] ||
+    { m8_oss_die "fresh live ECS role '$live' does not match the stored observed role '$stored'"; return 1; }
+  [[ "$live" == "$(m8_oss_config_role_name)" ]] ||
+    { m8_oss_die "fresh live ECS role '$live' does not match the proof-tree config role"; return 1; }
+  M8_OSS_LIVE_ROLE_NAME="$live"
+  export M8_OSS_LIVE_ROLE_NAME
   return 0
 }
 
@@ -192,21 +279,19 @@ PY
   return 0
 }
 
-# --- CLI-pinned trust target -------------------------------------------------
-# Every network-capable invocation receives the canonical global arguments.
-# Fails closed if the observed role name is not yet established.
+# --- CLI-pinned OSS network target ------------------------------------------
+# Every network-capable invocation performs the FRESH live role cross-binding
+# first, then receives exactly the five pinned global arguments. The role is
+# bound through the proof-tree config, NOT through a CLI flag: ossutil 2.4.0
+# does not support --ecs-role-name and rejects Ali-EcsRamRole via CLI --mode.
 m8_oss_global_args() {
-  local role config
-  role=$(m8_oss_ecs_role_name)
-  [[ -n "$role" ]] ||
-    { m8_oss_die 'observed ECS RAM role name is not established; refusing any OSS call'; return 1; }
+  local config
+  m8_oss_live_role_cross_binding_guard || return 1
   config=$(m8_oss_canonical_config_path) || return 1
   M8_OSS_GLOBAL_ARGS=(
     --config-file "$config"
     --region "$M8_OSS_REGION"
     --endpoint "$M8_OSS_ENDPOINT"
-    --mode "$M8_OSS_AUTH_MODE"
-    --ecs-role-name "$role"
     --addressing-style "$M8_OSS_ADDRESSING_STYLE"
     --ignore-env-var
   )
@@ -239,7 +324,7 @@ m8_oss_run() {
 m8_oss_capability_guard() {
   local evidence=${1:-'-'} op probe_output='' aggregate='' probe_ok=0
   local -a operations=(put-object get-object head-object get-bucket-versioning get-bucket-location)
-  local -a global_flags=(--config-file --region --endpoint --mode --ecs-role-name --addressing-style --ignore-env-var)
+  local -a global_flags=(--config-file --region --endpoint --addressing-style --ignore-env-var)
   local help_output='' help_ok=0 probes_ok=0
 
   m8_oss_require_config || return 1
@@ -301,8 +386,9 @@ m8_oss_capability_guard() {
   grep -Eiq 'forbid[-_]overwrite' <<<"$aggregate" ||
     { m8_oss_die "ossutil does not demonstrate the '--forbid-overwrite' put-object parameter"; return 1; }
 
-  # R2I-C4: the pinned global flags must be documented too, otherwise the
-  # canonical CLI trust target could not be established fail-closed.
+  # R2I-C11: the five CLI-pinned global flags must be documented. --mode and
+  # --ecs-role-name are deliberately NOT CLI pins: the role binding lives in the
+  # proof-tree canonical config and is cross-bound live before every call.
   local flag
   for flag in "${global_flags[@]}"; do
     grep -Eq -- "(^|[^a-z-])${flag}([^a-z-]|$)" <<<"$aggregate" ||
@@ -435,6 +521,11 @@ m8_oss_trust_profile_sha256() {
 
 m8_oss_trust_profile_assert_canonical() {
   local bytes count
+  # R2I-C11: eligibility requires the stored observed role to be cross-bound to
+  # the proof-tree config role. This is a purely LOCAL check, so deterministic
+  # profile serialization never performs provider network access. The fresh live
+  # cross-binding happens in m8_oss_global_args before every OSS network call.
+  m8_oss_role_binding_guard || return 1
   bytes=$(m8_oss_trust_profile_values | wc -c | tr -d '[:space:]')
   count=$(m8_oss_trust_profile_values | grep -c '^[a-z0-9_]*=')
   [[ "$count" == '18' ]] || { m8_oss_die "trust profile must contain exactly 18 records (got $count)"; return 1; }
@@ -469,66 +560,211 @@ m8_oss_versioning_guard() {
 
   # The classifier program is supplied on stdin, so the API response is
   # classified from a file: it must not also try to read the response from stdin.
+  #
+  # R2I-C12: the XML branch is STRUCTURED (xml.etree.ElementTree), never regex.
+  # The exact live ossutil 2.4.0 response is
+  #   <VersioningConfiguration xmlns="http://doc.oss-cn-hangzhou.aliyuncs.com"/>
+  #   0.087913(s) elapsed
+  # i.e. an official default namespace plus ONE terminal timing footer; the old
+  # regex fullmatch classifier rejected that legitimate response as unparseable.
+  # At most one terminal footer is recognised and removed; everything else stays
+  # fail-closed.
+  #
+  # R2I-C12-A1: the payload reaches the parser unmodified. There is NO XML prolog
+  # stripping (which could repair a malformed declaration), the footer line must
+  # match the frozen grammar exactly, and comments/processing instructions are
+  # made observable so they can never be silently dropped.
   raw_file=$(mktemp "${TMPDIR:-/tmp}/m8-versioning.XXXXXX")
   printf '%s' "$raw" > "$raw_file"
   verdict=$("$(m8_python_bin)" - "$raw_file" <<'PY'
 import json
 import re
 import sys
+import xml.etree.ElementTree as ET
 
-with open(sys.argv[1], encoding="utf-8", errors="replace") as handle:
-    raw = handle.read()
+OFFICIAL_NS = "http://doc.oss-cn-hangzhou.aliyuncs.com"
+# Frozen footer grammar. The footer LINE must match this exactly: no leading or
+# trailing whitespace is tolerated and the decimal syntax is not widened.
+TIMING_FOOTER = re.compile(r"[0-9]+\.[0-9]+\(s\) elapsed")
+
+
+class VersioningTreeBuilder(ET.TreeBuilder):
+    # R2I-C12-A1: the default TreeBuilder SILENTLY DROPS comments and processing
+    # instructions, which made
+    #   <VersioningConfiguration><!--c--></VersioningConfiguration>
+    #   <VersioningConfiguration><?m8 x?></VersioningConfiguration>
+    # look structurally empty. insert_comments/insert_pis make them observable,
+    # and the counter makes any comment/PI anywhere -- inside the root or at
+    # document level before/after it -- fail closed.
+    def __init__(self):
+        super().__init__(insert_comments=True, insert_pis=True)
+        self.non_element_nodes = 0
+
+    def comment(self, text):
+        self.non_element_nodes += 1
+        return super().comment(text)
+
+    def pi(self, target, text=None):
+        self.non_element_nodes += 1
+        return super().pi(target, text)
+
 
 def emit(value):
     sys.stdout.write(value + "\n")
     sys.exit(0)
 
-stripped = raw.strip()
-if stripped == "":
+
+def classify_status(value):
+    # Frozen C12 rule: only absent / empty / Null may mean UNVERSIONED.
+    # Case-sensitive: the historical blanket lower() is deliberately dropped, and
+    # the "unversioned"/"none" magic aliases are no longer recognised.
+    if value is None:
+        return "UNVERSIONED"
+    text = value if isinstance(value, str) else str(value)
+    if text.strip() == "":
+        return "UNVERSIONED"
+    if text == "Null":
+        return "UNVERSIONED"
+    if text == "Enabled":
+        return "ENABLED"
+    if text == "Suspended":
+        return "SUSPENDED"
+    return "UNKNOWN:" + text.strip()
+
+
+def split_tag(tag):
+    if not isinstance(tag, str):
+        return "", None
+    if tag.startswith("{"):
+        namespace, _, local = tag[1:].partition("}")
+        return namespace, local
+    return "", tag
+
+
+with open(sys.argv[1], "rb") as handle:
+    data = handle.read()
+
+# Strict UTF-8: a malformed byte sequence is never silently normalised.
+try:
+    text = data.decode("utf-8")
+except UnicodeDecodeError:
+    emit("UNPARSEABLE")
+
+# At most ONE terminal timing footer may be removed. Trailing blank /
+# whitespace-only LINES may be ignored, but the footer line itself must match the
+# frozen grammar EXACTLY (no .strip() around the match): a line carrying leading
+# or trailing whitespace is not a footer and is therefore parsed as payload.
+lines = text.split("\n")
+while lines and lines[-1].strip() == "":
+    lines.pop()
+if lines and TIMING_FOOTER.fullmatch(lines[-1]):
+    lines.pop()
+    while lines and lines[-1].strip() == "":
+        lines.pop()
+# A second timing-footer record is a failure, never a second removal.
+if lines and TIMING_FOOTER.fullmatch(lines[-1]):
+    emit("UNPARSEABLE")
+
+# No blanket strip: the payload is handed to the parser unmodified (modulo the
+# authorized footer removal), so a malformed XML declaration can never be
+# repaired by trimming bytes. A whitespace-only successful response keeps the
+# historical UNVERSIONED classification.
+body = "\n".join(lines)
+if body.strip() == "":
     emit("UNVERSIONED")
 
-status = None
-match = re.search(r"<Status>\s*([^<]*?)\s*</Status>", stripped)
-if match:
-    status = match.group(1)
-else:
-    doc = None
+# Branch selection only: the parser still receives the unmodified payload, so
+# leading whitespace before a root element follows XML parser semantics while a
+# whitespace-preceded XML declaration stays malformed and is rejected.
+if body.strip().startswith("<"):
+    # DOCTYPE / ENTITY are rejected case-insensitively before parsing, and the
+    # parser is never asked to expand external entities.
+    lowered = body.lower()
+    if "<!doctype" in lowered or "<!entity" in lowered:
+        emit("UNPARSEABLE")
+
+    # The ORIGINAL payload is parsed. A valid XML declaration is validated by the
+    # parser itself; a malformed one is a hard ParseError. There is deliberately
+    # NO prolog stripping, because removing bytes before parsing could turn
+    # malformed XML into valid XML.
+    builder = VersioningTreeBuilder()
+    parser = ET.XMLParser(target=builder)
     try:
-        doc = json.loads(stripped)
-    except Exception:
-        doc = None
-    if isinstance(doc, dict):
-        value = None
-        for key in ("Status", "status"):
-            if key in doc:
-                value = doc[key]
-                break
-        if value is None:
-            inner = doc.get("VersioningConfiguration")
-            if isinstance(inner, dict):
-                value = inner.get("Status", inner.get("status"))
-        if value is None:
-            if len(doc) == 0 or set(doc).issubset({"VersioningConfiguration", "ResponseMetadata"}):
-                emit("UNVERSIONED")
-            else:
-                emit("UNPARSEABLE")
-        status = str(value)
-    elif doc is None:
-        if re.fullmatch(r"(?is)(<\?xml[^>]*\?>\s*)?<VersioningConfiguration\s*/>", stripped) or \
-           re.fullmatch(r"(?is)(<\?xml[^>]*\?>\s*)?<VersioningConfiguration>\s*</VersioningConfiguration>", stripped):
-            emit("UNVERSIONED")
+        parser.feed(body)
+        root = parser.close()
+    except ET.ParseError:
         emit("UNPARSEABLE")
-    else:
+    except Exception:
         emit("UNPARSEABLE")
 
-normalised = (status or "").strip().lower()
-if normalised in ("", "null", "unversioned", "none"):
-    emit("UNVERSIONED")
-if normalised == "enabled":
-    emit("ENABLED")
-if normalised == "suspended":
-    emit("SUSPENDED")
-emit("UNKNOWN:" + (status or "").strip())
+    # Eligible XML contains no comment and no processing instruction anywhere,
+    # including at document level around the root, where the default TreeBuilder
+    # would have dropped them silently.
+    if builder.non_element_nodes > 0:
+        emit("UNPARSEABLE")
+    if root is None:
+        emit("UNPARSEABLE")
+
+    root_ns, root_local = split_tag(root.tag)
+    if root_local != "VersioningConfiguration":
+        emit("UNPARSEABLE")
+    if root_ns not in ("", OFFICIAL_NS):
+        emit("UNPARSEABLE")
+    if root.attrib:
+        emit("UNPARSEABLE")
+    if (root.text or "").strip():
+        emit("UNPARSEABLE")
+
+    children = list(root)
+    for child in children:
+        if (child.tail or "").strip():
+            emit("UNPARSEABLE")
+    if len(children) == 0:
+        emit("UNVERSIONED")
+    if len(children) > 1:
+        emit("UNPARSEABLE")
+
+    status = children[0]
+    status_ns, status_local = split_tag(status.tag)
+    if status_local != "Status":
+        emit("UNPARSEABLE")
+    if status_ns != root_ns:
+        emit("UNPARSEABLE")
+    if status.attrib:
+        emit("UNPARSEABLE")
+    if len(list(status)) != 0:
+        emit("UNPARSEABLE")
+    emit(classify_status(status.text))
+
+# JSON compatibility branch, with the same frozen status semantics.
+try:
+    doc = json.loads(body)
+except Exception:
+    emit("UNPARSEABLE")
+
+if not isinstance(doc, dict):
+    emit("UNPARSEABLE")
+
+found = False
+value = None
+for key in ("Status", "status"):
+    if key in doc:
+        value = doc[key]
+        found = True
+        break
+if not found:
+    inner = doc.get("VersioningConfiguration")
+    if isinstance(inner, dict):
+        for key in ("Status", "status"):
+            if key in inner:
+                value = inner[key]
+                found = True
+                break
+if not found:
+    if len(doc) == 0 or set(doc).issubset({"VersioningConfiguration", "ResponseMetadata"}):
+        emit("UNVERSIONED")
+    emit("UNPARSEABLE")
+emit(classify_status(value))
 PY
   ) || {
     rm -f "$raw_file"

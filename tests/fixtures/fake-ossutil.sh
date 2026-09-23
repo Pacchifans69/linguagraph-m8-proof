@@ -6,7 +6,17 @@
 # bucket. Behaviour is driven by M8_FAKE_OSS_* environment variables:
 #
 #   M8_FAKE_OSS_ROOT          required object-store root
-#   M8_FAKE_OSS_VERSIONING    unversioned|enabled|suspended|null|garbage|denied
+#   M8_FAKE_OSS_VERSIONING    unversioned|live_namespace_timing|namespace_empty|
+#                             no_namespace_empty|null|enabled|suspended|
+#                             unknown_namespace|unexpected_child|duplicate_status|
+#                             nested_status|root_attribute|wrong_root|
+#                             malformed_xml|doctype|entity|trailing_garbage|
+#                             double_timing_footer|unknown_status|
+#                             xml_decl_valid|xml_decl_garbage|xml_decl_attribute|
+#                             misplaced_declaration|leading_ws_root|comment_child|
+#                             pi_child|outer_comment_before|outer_comment_after|
+#                             outer_pi_before|outer_pi_after|footer_leading_space|
+#                             footer_trailing_space|exact_footer|garbage|denied
 #   M8_FAKE_OSS_LOCATION      cn-hongkong|wrong-region|denied|garbage|empty
 #   M8_FAKE_OSS_CAPABILITY    full|no-forbid-overwrite|no-global-flags|no-location
 #   M8_FAKE_OSS_MUTATION_LOG  append-only op log (READ/WRITE ordering)
@@ -19,10 +29,24 @@
 # `--body file://<path>` and fails closed on a bare local path, so a regression
 # back to `--body "$file"` is detected by the offline suite.
 #
-# R2I-C4/B03: the stub also parses and records the canonical global trust-target
-# arguments (--config-file, --region, --endpoint, --mode, --ecs-role-name,
-# --addressing-style, --ignore-env-var) so tests can prove every real API call
-# is issued through the pinned CLI trust target.
+# R2I-C11/C4: the stub parses and records the five canonical CLI-pinned global
+# arguments (--config-file, --region, --endpoint, --addressing-style,
+# --ignore-env-var) AND the auth binding that now lives in the canonical config.
+#
+# Real ossutil 2.4.0 surface (proven live):
+#   * `--ecs-role-name` is NOT a flag at all -> "unknown flag: --ecs-role-name";
+#   * the captured 2.4.0 help declares the exact CLI --mode valid value set
+#         valid value(s): "AK","StsToken","EcsRamRole","Anonymous"
+#     so `Ali-EcsRamRole` AND `RamRoleArn` are rejected
+#                                            -> "invalid value for flag(s) mode";
+#   * the working binding is config `mode=Ali-EcsRamRole` + `ecsRoleName=<role>`.
+# The stub therefore REJECTS an explicit CLI --ecs-role-name and REJECTS both
+# `Ali-EcsRamRole` and `RamRoleArn` through CLI --mode exactly as the real parser
+# does, while accepting exactly the CLI mode values the captured help lists
+# (AK, StsToken, EcsRamRole, Anonymous) -- no invented mode. It advertises only
+# the five pinned flags and distinguishes CLI mode/role from CONFIG mode/role in
+# its argument log. For the auth-path surface this harness depends on, the stub is
+# never more permissive than the real binary.
 set -Eeuo pipefail
 
 FAKE_ROOT="${M8_FAKE_OSS_ROOT:?M8_FAKE_OSS_ROOT is required}"
@@ -35,15 +59,19 @@ log() { printf '%s\n' "$*" >>"$LOG"; }
 object_path() { printf '%s/objects/%s/%s' "$FAKE_ROOT" "$1" "$2"; }
 
 # --- synthetic global trust-target capture ----------------------------------
-G_CONFIG=''; G_REGION=''; G_ENDPOINT=''; G_MODE=''; G_ROLE=''
+G_CONFIG=''; G_REGION=''; G_ENDPOINT=''
+G_CLI_MODE=''; G_CLI_ROLE=''
+G_CONFIG_MODE=''; G_CONFIG_ROLE=''
 G_ADDRESSING=''; G_IGNORE_ENV='no'; G_FORBIDDEN=''
 
 record_args() {
   local command=$1 operation=$2
   if [[ -n "${M8_FAKE_OSS_ARG_LOG:-}" ]]; then
-    printf 'ARGS command=%s operation=%s config_file=%s region=%s endpoint=%s mode=%s ecs_role_name=%s addressing_style=%s ignore_env_var=%s forbidden=%s\n' \
-      "$command" "$operation" "$G_CONFIG" "$G_REGION" "$G_ENDPOINT" "$G_MODE" \
-      "$G_ROLE" "$G_ADDRESSING" "$G_IGNORE_ENV" "${G_FORBIDDEN:-none}" >>"$M8_FAKE_OSS_ARG_LOG"
+    printf 'ARGS command=%s operation=%s config_file=%s region=%s endpoint=%s config_mode=%s config_role=%s cli_mode=%s cli_role=%s addressing_style=%s ignore_env_var=%s forbidden=%s\n' \
+      "$command" "$operation" "$G_CONFIG" "$G_REGION" "$G_ENDPOINT" \
+      "${G_CONFIG_MODE:-none}" "${G_CONFIG_ROLE:-none}" \
+      "${G_CLI_MODE:-none}" "${G_CLI_ROLE:-none}" \
+      "$G_ADDRESSING" "$G_IGNORE_ENV" "${G_FORBIDDEN:-none}" >>"$M8_FAKE_OSS_ARG_LOG"
   fi
 }
 
@@ -51,9 +79,16 @@ note_forbidden() {
   if [[ -z "$G_FORBIDDEN" ]]; then G_FORBIDDEN="$1"; else G_FORBIDDEN="$G_FORBIDDEN,$1"; fi
 }
 
+# Extract the auth binding the real binary would read from the pinned config.
+read_config_binding() {
+  [[ -n "$G_CONFIG" && -f "$G_CONFIG" ]] || return 0
+  G_CONFIG_MODE="$(sed -n 's/^mode=//p' "$G_CONFIG" | head -n1)"
+  G_CONFIG_ROLE="$(sed -n 's/^ecsRoleName=//p' "$G_CONFIG" | head -n1)"
+}
+
 print_api_help() {
   printf 'ossutil api <operation> [parameters]\n'
-  printf 'global options: --config-file --region --endpoint --mode --ecs-role-name --addressing-style --ignore-env-var\n'
+  printf 'global options: --config-file --region --endpoint --addressing-style --ignore-env-var\n'
   printf 'operations: put-object get-object head-object get-bucket-versioning get-bucket-location\n'
   printf '  put-object: --bucket --key --body --forbid-overwrite\n'
   printf '  get-object: --bucket --key\n'
@@ -75,8 +110,29 @@ while (($#)); do
     --config-file|-c)   G_CONFIG="$2"; shift 2 ;;
     --region)           G_REGION="$2"; shift 2 ;;
     --endpoint|-e)      G_ENDPOINT="$2"; shift 2 ;;
-    --mode)             G_MODE="$2"; shift 2 ;;
-    --ecs-role-name)    G_ROLE="$2"; shift 2 ;;
+    # Exact ossutil 2.4.0 CLI --mode surface, taken from the captured live help:
+    #     valid value(s): "AK","StsToken","EcsRamRole","Anonymous"
+    # The C11 synthetic surface must not invent a CLI mode the real binary
+    # rejects, and must not accept `Ali-EcsRamRole` (or `RamRoleArn`) through CLI
+    # --mode. This models the parser surface only: the stub is a local directory
+    # and never reads, prints or persists credentials, so accepting the
+    # credential-free `Anonymous` parser value weakens no credential boundary.
+    --mode)
+      (($# >= 2)) || { printf 'Error: missing value for --mode\n' >&2; exit 1; }
+      case "$2" in
+        AK|StsToken|EcsRamRole|Anonymous) G_CLI_MODE="$2"; shift 2 ;;
+        *)
+          printf 'Error: invalid value for flag(s) "mode"\n' >&2
+          exit 1
+          ;;
+      esac
+      ;;
+    # The real ossutil 2.4.0 has no such flag. Reject it exactly as the real
+    # binary does, so a regression back to a CLI role pin fails loudly.
+    --ecs-role-name)
+      printf 'Error: unknown flag: --ecs-role-name\n' >&2
+      exit 1
+      ;;
     --addressing-style) G_ADDRESSING="$2"; shift 2 ;;
     --ignore-env-var)   G_IGNORE_ENV='yes'; shift ;;
     --profile)          shift 2 ;;
@@ -90,6 +146,7 @@ while (($#)); do
     *)                  break ;;
   esac
 done
+read_config_binding
 
 command="${1:-}"
 shift || true
@@ -102,14 +159,14 @@ case "$command" in
   help)
     if [[ "$CAPABILITY" == 'no-forbid-overwrite' ]]; then
       printf 'ossutil api <operation> [parameters]\n'
-      printf 'global options: --config-file --region --endpoint --mode --ecs-role-name --addressing-style --ignore-env-var\n'
+      printf 'global options: --config-file --region --endpoint --addressing-style --ignore-env-var\n'
       printf 'operations: put-object get-object head-object get-bucket-versioning get-bucket-location\n'
       printf '  put-object: --bucket --key --body\n'
     elif [[ "$CAPABILITY" == 'no-global-flags' ]]; then
       print_global_only_help
     elif [[ "$CAPABILITY" == 'no-location' ]]; then
       printf 'ossutil api <operation> [parameters]\n'
-      printf 'global options: --config-file --region --endpoint --mode --ecs-role-name --addressing-style --ignore-env-var\n'
+      printf 'global options: --config-file --region --endpoint --addressing-style --ignore-env-var\n'
       printf 'operations: put-object get-object head-object get-bucket-versioning\n'
       printf '  put-object: --bucket --key --body --forbid-overwrite\n'
     else
@@ -185,11 +242,71 @@ case "$operation" in
     ;;
   get-bucket-versioning)
     log "READ get-bucket-versioning ${FLAG[bucket]:-}"
+    # R2I-C12: the exact live ossutil 2.4.0 XML+timing surface, plus the frozen
+    # structured-XML positive/negative matrix consumed by the C12 regressions.
+    # The stub is deterministic and never more permissive than the production
+    # classifier: it only emits response bytes, it classifies nothing.
     case "$VERSIONING" in
       unversioned) exit 0 ;;
+      # Exact live-captured bytes: official default namespace + ONE terminal
+      # timing footer. 94 bytes / SHA 68b07ea885b0284072d2ed8c29181aaa049a7f6c86034ef508fa0d277a9a5dd4
+      live_namespace_timing)
+        printf '<VersioningConfiguration xmlns="http://doc.oss-cn-hangzhou.aliyuncs.com"/>\n0.087913(s) elapsed\n'
+        ;;
+      namespace_empty)
+        printf '<VersioningConfiguration xmlns="http://doc.oss-cn-hangzhou.aliyuncs.com"></VersioningConfiguration>\n'
+        ;;
+      no_namespace_empty) printf '<VersioningConfiguration/>\n' ;;
       null) printf '<VersioningConfiguration><Status>Null</Status></VersioningConfiguration>\n' ;;
       enabled) printf '<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>\n' ;;
       suspended) printf '<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>\n' ;;
+      unknown_namespace)
+        printf '<VersioningConfiguration xmlns="http://evil.example/ns"/>\n'
+        ;;
+      unexpected_child)
+        printf '<VersioningConfiguration><Foo/></VersioningConfiguration>\n'
+        ;;
+      duplicate_status)
+        printf '<VersioningConfiguration><Status>Null</Status><Status>Null</Status></VersioningConfiguration>\n'
+        ;;
+      nested_status)
+        printf '<VersioningConfiguration><Status><Inner/></Status></VersioningConfiguration>\n'
+        ;;
+      root_attribute)
+        printf '<VersioningConfiguration foo="bar"/>\n'
+        ;;
+      wrong_root) printf '<VersioningConfig/>\n' ;;
+      malformed_xml) printf '<VersioningConfiguration><Status>Null</Status>\n' ;;
+      doctype)
+        printf '<!DOCTYPE VersioningConfiguration><VersioningConfiguration/>\n'
+        ;;
+      entity)
+        printf '<!ENTITY m8synth "x"><VersioningConfiguration/>\n'
+        ;;
+      trailing_garbage)
+        printf '<VersioningConfiguration/>\nsome unexpected trailing diagnostic\n'
+        ;;
+      double_timing_footer)
+        printf '<VersioningConfiguration/>\n0.1(s) elapsed\n0.2(s) elapsed\n'
+        ;;
+      unknown_status)
+        printf '<VersioningConfiguration><Status>Bogus</Status></VersioningConfiguration>\n'
+        ;;
+      # R2I-C12-A1: XML declaration / comment / PI / footer-grammar surface.
+      xml_decl_valid) printf '<?xml version="1.0"?>\n<VersioningConfiguration/>\n' ;;
+      xml_decl_garbage) printf '<?xml garbage?><VersioningConfiguration/>\n' ;;
+      xml_decl_attribute) printf '<?xml version="1.0" foo="bar"?><VersioningConfiguration/>\n' ;;
+      misplaced_declaration) printf '  <?xml version="1.0"?><VersioningConfiguration/>\n' ;;
+      leading_ws_root) printf '  <VersioningConfiguration/>\n' ;;
+      comment_child) printf '<VersioningConfiguration><!--comment--></VersioningConfiguration>\n' ;;
+      pi_child) printf '<VersioningConfiguration><?m8 x?></VersioningConfiguration>\n' ;;
+      outer_comment_before) printf '<!--c--><VersioningConfiguration/>\n' ;;
+      outer_comment_after) printf '<VersioningConfiguration/><!--c-->\n' ;;
+      outer_pi_before) printf '<?pi x?><VersioningConfiguration/>\n' ;;
+      outer_pi_after) printf '<VersioningConfiguration/><?pi x?>\n' ;;
+      footer_leading_space) printf '<VersioningConfiguration/>\n  0.1(s) elapsed\n' ;;
+      footer_trailing_space) printf '<VersioningConfiguration/>\n0.1(s) elapsed  \n' ;;
+      exact_footer) printf '<VersioningConfiguration/>\n0.087913(s) elapsed\n' ;;
       garbage) printf 'this is not a versioning document at all\n' ;;
       denied)
         printf 'Error: AccessDenied: no permission to get bucket versioning\n' >&2

@@ -122,8 +122,12 @@ but are not part of the immutable execution identity.
 The same library performs the read-only ECS RAM **role-name** observation used to
 pin the OSS auth mode, querying only the role-name LIST endpoint
 (`meta-data/ram/security-credentials/`) and never the credential-payload
-endpoint. The observed name is a live binding: it is never hard-coded here or in
-the harness, and it must be a single plain role name.
+endpoint. Two distinct things must never be conflated here. The **expected** role
+name is proof-tree pinned by the canonical config below and is therefore
+repository-known. The **actual** attached role returned by that live observation
+is *not* repository-known: it is runtime-unproven until observed, must be a
+single plain role name, and must cross-bind exactly against the proof-tree pin
+before any OSS call.
 
 ### OSS object model
 
@@ -172,43 +176,67 @@ The manifest and archive digests are computed over those exact file bytes.
 The proof harness **never installs ossutil**; host provisioning supplies it. A
 capability guard must demonstrate support for
 `ossutil api put-object --forbid-overwrite true`, `get-object`, `head-object`,
-`get-bucket-versioning` and `get-bucket-location`, **and** for the seven pinned
+`get-bucket-versioning` and `get-bucket-location`, **and** for the five pinned
 global flags listed under *OSS trust target* below; otherwise the wrapper fails
 closed.
 
-### OSS trust target (CLI-pinned, EcsRamRole only)
+### OSS trust target (proof-tree role-bound config + CLI-pinned network target)
 
-The trust model identifier is `CLI_PINNED_PROOF_TREE_CONFIG_ECS_RAM_ROLE`. Every
-network-capable `ossutil` invocation is issued through one canonical CLI trust
-target; ambient configuration is impossible by construction:
+The trust model is `PROOF_TREE_PINNED_IMDSV2_ECS_ROLE` +
+`CLI_PINNED_OSS_NETWORK_TARGET`. Ambient configuration is impossible by
+construction:
 
 ```bash
 ossutil --config-file <proof-tree config> \
   --region cn-hongkong \
   --endpoint https://oss-cn-hongkong-internal.aliyuncs.com \
-  --mode EcsRamRole --ecs-role-name <observed live role> \
   --addressing-style virtual --ignore-env-var \
   api <operation> ...
 ```
 
+There is deliberately **no CLI `--mode` and no CLI `--ecs-role-name`**. Live
+runtime on the bound host proved that ossutil **2.4.0** supports neither:
+`--ecs-role-name` is rejected as `unknown flag`, and `Ali-EcsRamRole` is rejected
+through CLI `--mode` as `invalid value for flag(s) "mode"`. The captured 2.4.0
+help declares the CLI `--mode` valid set as exactly
+`"AK","StsToken","EcsRamRole","Anonymous"`; `Ali-EcsRamRole` and `RamRoleArn` are
+both outside it, so no CLI mode can express this trust target. The role binding
+therefore lives in the proof-tree canonical config and is cross-bound before any
+network access.
+
 - **Endpoint.** The frozen endpoint is the HTTPS **in-region internal** endpoint
   (`endpoint_class=INTERNAL`, `network_policy=SAME_REGION_INTERNAL_ONLY`). No
   public, cross-region or caller-selected endpoint is ever used.
-- **Authentication.** `EcsRamRole` only. The harness never carries an
-  AK/SK, STS token or explicit RAM role ARN: `--access-key-id`,
-  `--access-key-secret`, `--sts-token`, `--ram-role-arn` and
-  `--role-session-name` are structurally absent, and TLS verification is never
-  disabled (`--skip-verify-cert` is never used).
-- **Role name.** The role name is **observed read-only at runtime** from the
-  IMDS role-name LIST endpoint
-  (`meta-data/ram/security-credentials/`). Zero roles, multiple roles, control
-  characters, a CR or a path-like value all fail closed. The credential-payload
-  endpoint is never requested.
+- **Authentication.** The config selects `mode=Ali-EcsRamRole`, so the official
+  ossutil `Ali-EcsRamRole` credential provider authenticates the call. That
+  provider **may internally retrieve temporary credentials through IMDSv2** —
+  this document does not claim otherwise. Our harness never prints, persists or
+  places those credential values in evidence, and never carries an AK/SK, STS
+  token or explicit RAM role ARN: `--access-key-id`, `--access-key-secret`,
+  `--sts-token`, `--ram-role-arn` and `--role-session-name` are structurally
+  absent, and TLS verification is never disabled (`--skip-verify-cert` is never
+  used).
+- **Role binding — two independent authorities.** The binding is *not* weakened
+  by losing the CLI flag; it moves to a verified chain:
+  1. the durable provider helper (`scripts/lib/m8-provider-identity.sh`) observes
+     the attached role **read-only** from the IMDSv2 role-name LIST endpoint
+     (`meta-data/ram/security-credentials/`) — zero roles, multiple roles,
+     control characters, a CR, a NUL or a path-like value all fail closed, and
+     the credential-payload endpoint is never requested;
+  2. the proof-tree config supplies `ecsRoleName`;
+  3. the stored observed role must equal the config role;
+  4. before **every** network-capable call, the fresh live observation must equal
+     **both** the stored observed role and the config role.
+  Any disagreement, or a missing durable provider helper, fails closed **before**
+  ossutil is invoked. There is no fallback to the stored value.
 - **Configuration.** `scripts/config/m8-ossutil-formal.ini` is a **proof-tree
-  inert config** (22 bytes, `[default]` + `language=EN` only) with a frozen
-  SHA-256. It must be a regular, non-symlinked, in-worktree file with exactly
-  that byte identity, and it must declare no other key. There is **no fallback**
-  to `~/.ossutilconfig` or to any caller-selected profile.
+  role-bound config** (81 bytes) with a frozen SHA-256:
+  `[default]` + `language=EN` + `mode=Ali-EcsRamRole` +
+  `ecsRoleName=LinguaGraphM8ProofExecutor`, and nothing else. It must be a
+  regular, non-symlinked, in-worktree file with exactly that byte identity; the
+  guard also establishes that the config auth mode equals the frozen auth mode and
+  that the config role is non-empty. There is **no fallback** to
+  `~/.ossutilconfig` or to any caller-selected profile.
 - **Closed environment.** Nineteen ambient OSS/credential/proxy variable names
   constitute a closed trust environment
   (`m8-oss-env-closed/v1`). If any one is set — including
@@ -248,14 +276,32 @@ canonicalization. The digest is bound before the claim:
 No `PutObject` may occur before every trust-target step has succeeded; the first
 permitted mutating call of a formal run is the atomic claim.
 
-#### Live bindings this repository does NOT establish
+#### Expected pins vs. live bindings this repository does NOT establish
 
-The following eight values are **live, unbound and unproven** here. They are
-resolved at runtime and are deliberately never hard-coded in this repository or
-in this document: the canonical OSS **bucket name**; the **ECS RAM role name**;
-the **observed role identity**; the **RAM policy result**; the **ossutil path**;
-the **ossutil version**; the **ossutil binary SHA-256**; and the **live
-capability result** (including bucket location and versioning).
+Two classes of value must be kept distinct.
+
+**Repository-known expectations (pinned, but not evidence).** The canonical config
+pins the **expected ECS RAM role name** (`LinguaGraphM8ProofExecutor`) together
+with the frozen auth mode, and the config's exact 81-byte / SHA-256 identity. The
+frozen region, endpoint, endpoint class, network policy, addressing style, auth
+mode, TLS policy and closed-environment policy are likewise repository constants.
+None of these pins is evidence of anything on the host: they are the *expected*
+side of a cross-binding, and a mismatch fails closed rather than authorizing a
+call.
+
+The following eight values are **live and unproven** here. They are resolved at
+runtime, are never hard-coded in this repository or in this document, and carry
+no authority until they are observed and cross-bound: the canonical OSS **bucket
+name**; the **actual attached ECS RAM role name** returned by the live IMDSv2
+role-name observation; the **RAM policy result**; the **ossutil path**; the
+**ossutil version**; the **ossutil binary SHA-256**; the **live capability
+result**; and the **live bucket location and versioning result**.
+
+The *expected* role name is **proof-tree pinned** by the canonical config, but
+that pin is not evidence: the *actual* attached role remains a **live provider
+observation** and must cross-bind exactly against both the config role and the
+stored observed role before any network-capable call. A config pin that does not
+match the live attachment fails closed rather than authorizing anything.
 
 Nothing in this repository asserts that the bucket exists, that a role is
 attached to any instance, that any RAM policy has been proven, that `ossutil` is
@@ -540,6 +586,8 @@ R2E_B01_STATIC_CHECKS=11/11
 R2E_B01_SYNTHETIC_CHECKS=29/29
 R2I_C1_REGRESSIONS=2/2
 R2I_C4_B03_REGRESSIONS=12/12
+R2I_C7_PROVIDER_BINARY_REGRESSIONS=4/4
+R2I_C11_AUTH_PATH_REGRESSIONS=18/18
 ```
 
 `T01..T12` are the R2I-C4/B03 trust-target regressions: the closed
@@ -547,8 +595,21 @@ trust-environment set, CLI trust-target pinning, canonical config identity,
 ossutil identity and version floor, bucket-location guard, read-only role-name
 observation, trust-profile canonicalization and digest sensitivity,
 authorization/claim/package-index/receipt binding, receipt verification, retry
-trust-target identity, and pre-claim ordering. Each is separately load-bearing:
-removing its production mechanism in a scratch copy makes that check fail.
+trust-target identity, and pre-claim ordering. `P01..P04` are the R2I-C7
+binary-safety regressions for the immutable provider identity inputs. `S01..S18`
+are the R2I-C11 auth-path regressions: the 81-byte role-bound config identity, the
+five-flag CLI vector with no `--mode`/`--ecs-role-name`, the synthetic ossutil's
+real 2.4.0 surface, and the three fail-closed cross-binding branches (missing stored role,
+stored role ≠ config role, fresh live role ≠ stored/config role, and a missing
+durable provider helper with no stored-value fallback) plus the 18-record profile
+semantics. The synthetic 2.4.0 CLI surface is modelled exactly, not approximately:
+help does not advertise the role flag; an explicit `--ecs-role-name` is rejected as
+an unknown flag; the CLI `--mode` valid set is exactly the captured live set
+(`AK`, `StsToken`, `EcsRamRole`, `Anonymous`) — no invented mode — so
+`Ali-EcsRamRole` and `RamRoleArn` are both rejected as an invalid mode value; and
+the credential-free `Anonymous` parser value is exercised only at the parser, never
+as an auth path. Each is separately load-bearing: removing its production mechanism
+in a scratch copy makes that check fail.
 
 ## Mutation boundary
 
