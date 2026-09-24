@@ -18,10 +18,13 @@
 #                             outer_pi_before|outer_pi_after|footer_leading_space|
 #                             footer_trailing_space|exact_footer|garbage|denied
 #   M8_FAKE_OSS_LOCATION      cn-hongkong|wrong-region|denied|garbage|empty
-#   M8_FAKE_OSS_CAPABILITY    full|no-forbid-overwrite|no-global-flags|no-location
+#   M8_FAKE_OSS_CAPABILITY    full|no-forbid-overwrite|no-global-flags|no-location|
+#                             no-get-object-quiet
 #   M8_FAKE_OSS_MUTATION_LOG  append-only op log (READ/WRITE ordering)
 #   M8_FAKE_OSS_BODY_LOG      append-only log of the exact --body argument
 #   M8_FAKE_OSS_ARG_LOG       append-only log of canonical global arguments
+#   M8_FAKE_OSS_GET_LOG       append-only log of GetObject response framing
+#                             (operation, body seam and --quiet presence)
 #   M8_FAKE_OSS_FAIL_PUT_KEY  make put-object for this key fail
 #   M8_FAKE_OSS_TAMPER_RECEIPT  path whose bytes are served for closure-receipt.json
 #
@@ -47,6 +50,18 @@
 # the five pinned flags and distinguishes CLI mode/role from CONFIG mode/role in
 # its argument log. For the auth-path surface this harness depends on, the stub is
 # never more permissive than the real binary.
+#
+# R2I-C13: live ossutil 2.4.0 appends a NON-BODY `<n>.<n>(s) elapsed` footer to
+# ordinary `get-object` stdout, and `get-object --quiet` suppresses that epilogue
+# while leaving the response-body bytes identical. The stub models exactly that:
+# without --quiet it writes the exact object bytes followed by the deterministic
+# 21-byte footer `\n0.089713(s) elapsed\n`; with --quiet it writes ONLY the object
+# bytes. The footer is a fixed constant -- never wall-clock time or randomness.
+# `--quiet`/`-q` are parsed deliberately for get-object and are never accepted
+# through the catch-all branch. In the `no-get-object-quiet` capability mode the
+# flag is neither advertised in help NOR accepted at runtime: both spellings are
+# rejected with a deterministic `Error: unknown flag: <flag>`, while an ordinary
+# no-quiet GetObject still succeeds (GetObject exists; quiet framing does not).
 set -Eeuo pipefail
 
 FAKE_ROOT="${M8_FAKE_OSS_ROOT:?M8_FAKE_OSS_ROOT is required}"
@@ -57,6 +72,11 @@ CAPABILITY="${M8_FAKE_OSS_CAPABILITY:-full}"
 
 log() { printf '%s\n' "$*" >>"$LOG"; }
 object_path() { printf '%s/objects/%s/%s' "$FAKE_ROOT" "$1" "$2"; }
+
+# R2I-C13: the exact live-captured elapsed epilogue as a fixed 21-byte constant.
+# Never derived from wall-clock time or randomness.
+GET_FOOTER=$'\n0.089713(s) elapsed\n'
+get_log() { printf '%s\n' "$*" >>"${M8_FAKE_OSS_GET_LOG:-/dev/null}"; }
 
 # --- synthetic global trust-target capture ----------------------------------
 G_CONFIG=''; G_REGION=''; G_ENDPOINT=''
@@ -91,10 +111,33 @@ print_api_help() {
   printf 'global options: --config-file --region --endpoint --addressing-style --ignore-env-var\n'
   printf 'operations: put-object get-object head-object get-bucket-versioning get-bucket-location\n'
   printf '  put-object: --bucket --key --body --forbid-overwrite\n'
-  printf '  get-object: --bucket --key\n'
+  if [[ "$CAPABILITY" == 'no-get-object-quiet' ]]; then
+    printf '  get-object: --bucket --key\n'
+  else
+    printf '  get-object: --bucket --key [--quiet|-q]\n'
+  fi
   printf '  head-object: --bucket --key\n'
   printf '  get-bucket-versioning: --bucket\n'
   printf '  get-bucket-location: --bucket\n'
+}
+
+# R2I-C13: emit a GetObject response body with the exact live 2.4.0 stdout
+# framing. $1 = source file. The body is never loaded into a shell variable: it is
+# copied or cat'ed byte-for-byte, and the deterministic footer is appended only
+# when --quiet is absent. Diagnostics never touch the response-body bytes.
+emit_get_body() {
+  local source=$1 seam='stdout' quiet='no'
+  if [[ -n "${FLAG[quiet]:-}" ]]; then quiet='yes'; fi
+  if [[ -n "${FLAG[output]:-}" ]]; then
+    seam='output'
+    cp -f "$source" "${FLAG[output]}"
+  else
+    cat "$source"
+  fi
+  if [[ "$quiet" == 'no' ]]; then
+    printf '%s' "$GET_FOOTER"
+  fi
+  get_log "operation=get-object seam=$seam quiet=$quiet"
 }
 
 print_global_only_help() {
@@ -195,6 +238,22 @@ while (($#)); do
       FLAG["${1#--}"]="$2"
       shift 2
       ;;
+    # R2I-C13: the live-proven GetObject response-framing flag, parsed
+    # deliberately rather than through the catch-all branch below.
+    --quiet|-q)
+      (($# >= 1)) || { printf 'Error: missing flag %s\n' "$1" >&2; exit 1; }
+      # R2I-C13 amendment: the dedicated negative capability means GetObject
+      # EXISTS but quiet framing is NOT supported. Hiding the flag from help is not
+      # enough -- the runtime parser must reject BOTH spellings exactly as a client
+      # built without the flag would, with a deterministic diagnostic naming the
+      # rejected flag.
+      if [[ "$operation" == 'get-object' && "$CAPABILITY" == 'no-get-object-quiet' ]]; then
+        printf 'Error: unknown flag: %s\n' "$1" >&2
+        exit 1
+      fi
+      FLAG[quiet]=1
+      shift
+      ;;
     *)
       shift
       ;;
@@ -212,7 +271,13 @@ if [[ -n "${FLAG[help]:-}" ]]; then
         printf 'put-object: --bucket --key --body --forbid-overwrite\n'
       fi
       ;;
-    get-object) printf 'get-object: --bucket --key\n' ;;
+    get-object)
+      if [[ "$CAPABILITY" == 'no-get-object-quiet' ]]; then
+        printf 'get-object: --bucket --key\n'
+      else
+        printf 'get-object: --bucket --key [--quiet|-q]\n'
+      fi
+      ;;
     head-object) printf 'head-object: --bucket --key\n' ;;
     get-bucket-versioning) printf 'get-bucket-versioning: --bucket\n' ;;
     get-bucket-location) printf 'get-bucket-location: --bucket\n' ;;
@@ -371,20 +436,12 @@ case "$operation" in
     destination="$(object_path "$bucket" "$key")"
     if [[ "$key" == *closure-receipt.json && -n "${M8_FAKE_OSS_TAMPER_RECEIPT:-}" ]]; then
       log "READ get-object $key (tampered)"
-      if [[ -n "${FLAG[output]:-}" ]]; then
-        cp -f "$M8_FAKE_OSS_TAMPER_RECEIPT" "${FLAG[output]}"
-      else
-        cat "$M8_FAKE_OSS_TAMPER_RECEIPT"
-      fi
+      emit_get_body "$M8_FAKE_OSS_TAMPER_RECEIPT"
       exit 0
     fi
     if [[ -f "$destination" ]]; then
       log "READ get-object $key"
-      if [[ -n "${FLAG[output]:-}" ]]; then
-        cp -f "$destination" "${FLAG[output]}"
-      else
-        cat "$destination"
-      fi
+      emit_get_body "$destination"
       exit 0
     fi
     printf 'Error: NoSuchKey: object %s does not exist (HTTP 404)\n' "$key" >&2

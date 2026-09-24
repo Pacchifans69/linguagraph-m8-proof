@@ -28,7 +28,13 @@
 #   * every PutObject body uses the official file form `--body file://<path>`;
 #     a bare local path is never passed as a body;
 #   * GetObject stays byte-exact: the response body goes straight from ossutil
-#     stdout into a file, never through shell command substitution or a variable;
+#     stdout into a file, never through shell command substitution or a variable.
+#     Live ossutil 2.4.0 additionally appends a NON-BODY `<n>.<n>(s) elapsed`
+#     footer to ordinary get-object stdout, so a bare redirect is not byte-exact
+#     on its own: production frames the call with `get-object --quiet`, which
+#     suppresses that client epilogue while leaving the response-body bytes
+#     identical. --quiet is a GetObject response-framing requirement, NOT a sixth
+#     CLI-pinned trust target; the five global pins below are unchanged;
 #   * bucket location must be cn-hongkong and bucket versioning must be
 #     unversioned before any PutObject; the harness has no PutBucketVersioning
 #     authority;
@@ -323,6 +329,7 @@ m8_oss_run() {
 # ---------------------------------------------------------------------------
 m8_oss_capability_guard() {
   local evidence=${1:-'-'} op probe_output='' aggregate='' probe_ok=0
+  local get_object_help='' get_object_probe_ok=0
   local -a operations=(put-object get-object head-object get-bucket-versioning get-bucket-location)
   local -a global_flags=(--config-file --region --endpoint --addressing-style --ignore-env-var)
   local help_output='' help_ok=0 probes_ok=0
@@ -364,6 +371,12 @@ m8_oss_capability_guard() {
     elif probe_output=$(m8_oss_api "$op" -h 2>&1); then
       probe_ok=1
     fi
+    # R2I-C13: keep the GetObject probe as a GetObject-scoped surface so the
+    # --quiet framing capability below can never be satisfied by unrelated help.
+    if [[ "$op" == 'get-object' ]]; then
+      get_object_help="$probe_output"
+      get_object_probe_ok=$probe_ok
+    fi
     (( probe_ok == 1 )) && probes_ok=$((probes_ok + 1))
     aggregate+=$'\n'"$probe_output"
     if [[ "$evidence" != '-' ]]; then
@@ -394,6 +407,32 @@ m8_oss_capability_guard() {
     grep -Eq -- "(^|[^a-z-])${flag}([^a-z-]|$)" <<<"$aggregate" ||
       { m8_oss_die "ossutil help does not document the required global flag '$flag'"; return 1; }
   done
+
+  # R2I-C13: GetObject response framing. Live ossutil 2.4.0 appends a non-body
+  # `<n>.<n>(s) elapsed` footer to ordinary `get-object` stdout, so the
+  # production helper REQUIRES `get-object --quiet`. Its absence FAILS CLOSED.
+  #
+  # This is a GetObject capability requirement, NOT a sixth CLI trust-target pin:
+  # --quiet is deliberately never added to M8_OSS_GLOBAL_ARGS.
+  #
+  # The assertion is bound to the GetObject surface, so unrelated help text that
+  # merely contains the word "quiet" cannot satisfy it. The per-operation probe is
+  # GetObject-scoped by construction; when a client does not support
+  # `api <op> --help`, the global help page must itself carry a get-object line
+  # that names the quiet flag.
+  if (( get_object_probe_ok == 1 )); then
+    grep -Eqi -- '(--quiet|-q)([^a-z-]|$)' <<<"$get_object_help" ||
+      {
+        m8_oss_die 'ossutil get-object does not demonstrate the required --quiet response-framing capability'
+        return 1
+      }
+  else
+    grep -Eqi -- '(^|[^a-z-])get-object([^a-z-]|$).*(--quiet|-q)([^a-z-]|$)' <<<"$aggregate" ||
+      {
+        m8_oss_die 'ossutil help does not demonstrate the required get-object --quiet response-framing capability'
+        return 1
+      }
+  fi
 
   if [[ "$evidence" != '-' ]]; then
     printf 'ossutil_capability=PASS\n' >> "$evidence/ossutil-capability.txt"
@@ -891,13 +930,23 @@ m8_oss_get_object() {
   rm -f "$tmp"
   output_flag="${M8_OSSUTIL_GET_OUTPUT_FLAG:-}"
 
+  # R2I-C13: `get-object --quiet` is REQUIRED. Live ossutil 2.4.0 writes a
+  # non-body `<n>.<n>(s) elapsed` footer to ordinary get-object stdout, so a bare
+  # redirect is not byte-exact. --quiet suppresses that client epilogue and
+  # leaves the response-body bytes identical. The helper always supplies it; it
+  # is never caller-selectable and never a global trust pin.
+  #
+  # In both branches the body still streams straight from ossutil stdout into a
+  # file -- never through shell command substitution, a shell variable or a
+  # textual parser -- and stderr stays separately captured for diagnosis on the
+  # production response-body path.
   if [[ -n "$output_flag" ]]; then
-    if ! m8_oss_api get-object --bucket "$(m8_oss_bucket)" --key "$key" \
+    if ! m8_oss_api get-object --quiet --bucket "$(m8_oss_bucket)" --key "$key" \
       "$output_flag" "$tmp" >"${tmp}.stdout" 2>&1; then
       rc=1
     fi
   else
-    if ! m8_oss_api get-object --bucket "$(m8_oss_bucket)" --key "$key" >"$tmp" 2>"${tmp}.stderr"; then
+    if ! m8_oss_api get-object --quiet --bucket "$(m8_oss_bucket)" --key "$key" >"$tmp" 2>"${tmp}.stderr"; then
       rc=1
     fi
   fi

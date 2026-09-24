@@ -42,6 +42,8 @@ R2I_C11_TOTAL=0
 R2I_C11_PASS=0
 R2I_C12_TOTAL=0
 R2I_C12_PASS=0
+R2I_C13_TOTAL=0
+R2I_C13_PASS=0
 declare -a FAILED_CHECKS=()
 
 run_check() {
@@ -55,6 +57,7 @@ run_check() {
     r2i_c7) R2I_C7_TOTAL=$((R2I_C7_TOTAL + 1)) ;;
     r2i_c11) R2I_C11_TOTAL=$((R2I_C11_TOTAL + 1)) ;;
     r2i_c12) R2I_C12_TOTAL=$((R2I_C12_TOTAL + 1)) ;;
+    r2i_c13) R2I_C13_TOTAL=$((R2I_C13_TOTAL + 1)) ;;
   esac
   out="$("$fn" 2>&1)" || rc=$?
   if (( rc == 0 )) && ! grep -q '^ASSERT_FAIL:' <<<"$out"; then
@@ -68,6 +71,7 @@ run_check() {
       r2i_c7) R2I_C7_PASS=$((R2I_C7_PASS + 1)) ;;
       r2i_c11) R2I_C11_PASS=$((R2I_C11_PASS + 1)) ;;
       r2i_c12) R2I_C12_PASS=$((R2I_C12_PASS + 1)) ;;
+      r2i_c13) R2I_C13_PASS=$((R2I_C13_PASS + 1)) ;;
     esac
   else
     printf 'FAIL [%-6s] %s %s\n' "$kind" "$id" "$desc"
@@ -1828,10 +1832,15 @@ c05() {
     # Static: the official form is used and the bare form is absent.
     assert_contains "$OSS_LIB" '--body "file://$file"'
     assert_no_contains "$OSS_LIB" '--body "$file"'
-    # GetObject stays binary: ossutil stdout goes straight into a file, is never
-    # captured by command substitution, and is installed with a rename.
+    # GetObject response framing (R2I-C13). A bare stdout->file redirect is NOT
+    # byte-exact on its own: live ossutil 2.4.0 appends a non-body elapsed footer
+    # to ordinary get-object stdout. The production helper must therefore frame
+    # the call with get-object --quiet, while the body still travels straight
+    # from ossutil stdout into the file -- never through command substitution --
+    # and is installed with an atomic rename.
     local get_body="$TMPROOT/c05-get-object"
     sed -n '/^m8_oss_get_object()/,/^}/p' "$OSS_LIB" >"$get_body"
+    assert_contains "$get_body" 'get-object --quiet'
     assert_contains "$get_body" '>"$tmp" 2>"${tmp}.stderr"'
     assert_no_contains "$get_body" '=$(m8_oss_api'
     assert_contains "$get_body" 'mv -f "$tmp" "$out"'
@@ -4021,6 +4030,300 @@ x27() {
 }
 
 # ===========================================================================
+# R2I-C13 — GetObject byte-exactness correction regressions (Y01..Y08).
+#
+# Live ossutil 2.4.0 appends a NON-BODY `<n>.<n>(s) elapsed` footer to ordinary
+# `get-object` stdout, so a bare stdout -> file redirection is NOT byte-exact.
+# Production therefore requires `get-object --quiet`; the synthetic client models
+# exactly that framing. These regressions are deliberately separate from the
+# V01..V40 / C01..C09 / I01..I02 / T01..T12 / P01..P04 / S01..S18 / X01..X27
+# sets: a green legacy baseline is not evidence of GetObject byte exactness.
+# ===========================================================================
+
+# The exact live-captured 21-byte elapsed epilogue, as an independent oracle.
+readonly C13_FOOTER=$'\n0.089713(s) elapsed\n'
+
+# Arm a complete synthetic network-capable OSS environment with a GetObject
+# framing log.
+c13_arm_oss_env() {
+  # shellcheck source=/dev/null
+  source "$OSS_LIB"
+  c11_arm_provider_seams
+  export M8_PROOF_ROOT="$REPO_ROOT"
+  export M8_OSS_BUCKET='test-bucket'
+  export M8_OSSUTIL_BIN="$FAKE_OSSUTIL"
+  export M8_FAKE_OSS_ROOT="$TMPROOT/c13-oss"
+  export M8_FAKE_OSS_LOCATION='cn-hongkong'
+  export M8_FAKE_OSS_VERSIONING='unversioned'
+  export M8_FAKE_OSS_GET_LOG="$TMPROOT/c13-get.log"
+  mkdir -p "$M8_FAKE_OSS_ROOT/objects/test-bucket"
+  : >"$M8_FAKE_OSS_GET_LOG"
+}
+
+# Stage a known object body directly in the synthetic store, so the read-back
+# source is reproducible without depending on the upload path.
+c13_stage_key() {
+  local key=$1 source=$2
+  local destination="$M8_FAKE_OSS_ROOT/objects/test-bucket/$key"
+  mkdir -p "$(dirname "$destination")"
+  cp -f "$source" "$destination"
+}
+
+# Y01 — the false oracle: plain stdout redirection is NOT byte-exact. Driving the
+# synthetic client WITHOUT quiet yields the exact body followed by the
+# deterministic footer.
+y01() {
+  local root="$TMPROOT/y01-oss" src="$TMPROOT/y01-src.txt" out="$TMPROOT/y01-out.txt"
+  local prefix="$TMPROOT/y01-prefix" tail="$TMPROOT/y01-tail" want="$TMPROOT/y01-footer"
+  mkdir -p "$root/objects/test-bucket/runs/y01"
+  printf 'no-quiet contamination payload\n' >"$src"
+  cp -f "$src" "$root/objects/test-bucket/runs/y01/a.txt"
+
+  # Exactly the shape the historical C05 oracle treated as byte-exactness proof.
+  M8_FAKE_OSS_ROOT="$root" "$FAKE_OSSUTIL" \
+    --config-file "$(c11_config_path)" \
+    api get-object --bucket test-bucket --key runs/y01/a.txt >"$out"
+
+  local src_bytes out_bytes
+  src_bytes=$(wc -c <"$src")
+  out_bytes=$(wc -c <"$out")
+  (( out_bytes > src_bytes )) ||
+    { printf 'Y01: no-quiet get-object stdout was not longer than the source\n'; return 1; }
+  assert_eq "$out_bytes" "$(( src_bytes + 21 ))" 'Y01: stdout is the source plus the 21-byte footer'
+
+  head -c "$src_bytes" "$out" >"$prefix"
+  cmp -s "$src" "$prefix" ||
+    { printf 'Y01: the exact source bytes are not the no-quiet stdout prefix\n'; return 1; }
+
+  printf '%s' "$C13_FOOTER" >"$want"
+  tail -c 21 "$out" >"$tail"
+  cmp -s "$want" "$tail" ||
+    { printf 'Y01: the deterministic elapsed footer is absent or wrong\n'; return 1; }
+
+  if cmp -s "$src" "$out"; then
+    printf 'Y01: plain stdout redirection was byte-exact (the oracle is still wrong)\n'
+    return 1
+  fi
+  printf 'Y01_NO_QUIET_CONTAMINATION=PASS\n'
+  return 0
+}
+
+# Y02 — production binds GetObject to --quiet, statically (function-scoped, never
+# a repository-wide grep) and behaviorally (synthetic framing log), while --quiet
+# stays OUT of the five-pin global vector.
+y02() {
+  local body="$TMPROOT/y02-get" gargs="$TMPROOT/y02-gargs"
+  sed -n '/^m8_oss_get_object()/,/^}/p' "$OSS_LIB" >"$body"
+  assert_file "$body"
+  assert_contains "$body" 'm8_oss_api get-object --quiet'
+  assert_no_contains "$body" 'm8_oss_api get-object --bucket'
+
+  sed -n '/^m8_oss_global_args()/,/^}/p' "$OSS_LIB" >"$gargs"
+  assert_file "$gargs"
+  assert_no_contains "$gargs" 'quiet'
+
+  (
+    c13_arm_oss_env
+    local src="$TMPROOT/y02-src" out="$TMPROOT/y02-out"
+    printf 'quiet framing probe\n' >"$src"
+    c13_stage_key 'runs/y02/a.txt' "$src"
+    m8_oss_get_object 'runs/y02/a.txt' "$out" - || return 1
+    assert_eq "$(wc -l <"$M8_FAKE_OSS_GET_LOG" | tr -d ' ')" '1' \
+      'Y02: exactly one GetObject invocation'
+    assert_eq "$(cat "$M8_FAKE_OSS_GET_LOG")" \
+      'operation=get-object seam=stdout quiet=yes' \
+      'Y02: production frames GetObject with --quiet'
+    m8_oss_global_args >/dev/null || return 1
+    assert_eq "${#M8_OSS_GLOBAL_ARGS[@]}" '9' 'Y02: five pins expand to nine argv tokens'
+    local joined=" ${M8_OSS_GLOBAL_ARGS[*]} "
+    assert_eq "$([[ "$joined" == *' --quiet '* ]] && echo present || echo absent)" \
+      'absent' 'Y02: --quiet is not a sixth trust-target pin'
+    printf 'Y02_PRODUCTION_USES_QUIET=PASS\n'
+  )
+}
+
+# Y03 — text payload byte exactness through production m8_oss_get_object.
+y03() {
+  (
+    c13_arm_oss_env
+    local src="$TMPROOT/y03-src" out="$TMPROOT/y03-out"
+    printf 'text payload\nexactly these bytes\n' >"$src"
+    c13_stage_key 'runs/y03/text.txt' "$src"
+    m8_oss_get_object 'runs/y03/text.txt' "$out" - || return 1
+    assert_eq "$(wc -c <"$out" | tr -d ' ')" "$(wc -c <"$src" | tr -d ' ')" 'Y03: byte count'
+    assert_eq "$(sha256sum "$out" | cut -d' ' -f1)" "$(sha256sum "$src" | cut -d' ' -f1)" \
+      'Y03: SHA-256'
+    cmp -s "$src" "$out" || { printf 'Y03: text payload is not byte-exact\n'; return 1; }
+    printf 'Y03_TEXT_BYTE_EXACT=PASS\n'
+  )
+}
+
+# Y04 — arbitrary binary payload byte exactness. The payload carries NUL, LF, CR,
+# DEL, 0x80 and 0xFF and is written straight to a file, never through shell
+# command substitution.
+y04() {
+  (
+    c13_arm_oss_env
+    local src="$TMPROOT/y04-bin" out="$TMPROOT/y04-out"
+    printf 'A\000B\nC\rD\177E\200\377F' >"$src"
+    assert_eq "$(wc -c <"$src" | tr -d ' ')" '12' 'Y04: binary source is 12 bytes'
+    c13_stage_key 'runs/y04/bin.dat' "$src"
+    m8_oss_get_object 'runs/y04/bin.dat' "$out" - || return 1
+    cmp -s "$src" "$out" || { printf 'Y04: binary payload is not byte-exact\n'; return 1; }
+    assert_eq "$(wc -c <"$out" | tr -d ' ')" "$(wc -c <"$src" | tr -d ' ')" 'Y04: byte count'
+    assert_eq "$(sha256sum "$out" | cut -d' ' -f1)" "$(sha256sum "$src" | cut -d' ' -f1)" \
+      'Y04: SHA-256'
+    printf 'Y04_BINARY_BYTE_EXACT=PASS\n'
+  )
+}
+
+# Y05 — the `no-get-object-quiet` capability means GetObject EXISTS but quiet
+# framing does not. Three distinct facts are proven: the capability guard fails
+# closed; the runtime parser rejects BOTH quiet spellings (hiding the flag from
+# help is not enough); and an ordinary no-quiet GetObject still works.
+y05() {
+  (
+    c13_arm_oss_env
+    local rc=0 out=''
+
+    # A. The capability guard fails closed for the GetObject quiet reason.
+    out="$(M8_FAKE_OSS_CAPABILITY=no-get-object-quiet m8_oss_capability_guard - 2>&1)" || rc=$?
+    (( rc != 0 )) ||
+      { printf 'Y05: the capability guard accepted a client without get-object --quiet\n'; return 1; }
+    grep -Fq 'get-object' <<<"$out" ||
+      { printf 'Y05: the refusal does not name get-object:\n%s\n' "$out"; return 1; }
+    grep -Fq -- '--quiet' <<<"$out" ||
+      { printf 'Y05: the refusal does not name --quiet:\n%s\n' "$out"; return 1; }
+    printf 'Y05_CAPABILITY_FAIL_CLOSED=PASS\n'
+
+    # B. Runtime parser fidelity: both spellings must be REJECTED, not merely
+    #    hidden. stderr is captured; stdout (a body, if any) goes to $body so a
+    #    silent success cannot masquerade as a rejection.
+    local src="$TMPROOT/y05-src" body="$TMPROOT/y05-body" flag
+    printf 'negative-mode body bytes\n' >"$src"
+    c13_stage_key 'runs/y05/a.txt' "$src"
+    for flag in --quiet -q; do
+      : >"$body"
+      out=''; rc=0
+      out="$(M8_FAKE_OSS_ROOT="$M8_FAKE_OSS_ROOT" M8_FAKE_OSS_CAPABILITY=no-get-object-quiet \
+        "$FAKE_OSSUTIL" --config-file "$(c11_config_path)" \
+        api get-object "$flag" --bucket test-bucket --key runs/y05/a.txt 2>&1 >"$body")" || rc=$?
+      (( rc != 0 )) ||
+        { printf 'Y05: no-get-object-quiet accepted %s at runtime\n' "$flag"; return 1; }
+      grep -Fq -- "$flag" <<<"$out" ||
+        { printf 'Y05: the %s rejection does not name the flag:\n%s\n' "$flag" "$out"; return 1; }
+      grep -Fqi 'unknown flag' <<<"$out" ||
+        { printf 'Y05: the %s rejection is not an unsupported-flag diagnostic:\n%s\n' "$flag" "$out"; return 1; }
+      [[ ! -s "$body" ]] ||
+        { printf 'Y05: %s still produced a response body\n' "$flag"; return 1; }
+    done
+    printf 'Y05_RUNTIME_QUIET_REJECTED=PASS\n'
+
+    # C. Control: the negative mode does NOT mean GetObject is broken. An ordinary
+    #    no-quiet GetObject still succeeds with body+footer framing.
+    : >"$body"; rc=0
+    M8_FAKE_OSS_ROOT="$M8_FAKE_OSS_ROOT" M8_FAKE_OSS_CAPABILITY=no-get-object-quiet \
+      "$FAKE_OSSUTIL" --config-file "$(c11_config_path)" \
+      api get-object --bucket test-bucket --key runs/y05/a.txt >"$body" 2>/dev/null || rc=$?
+    assert_eq "$rc" '0' 'Y05: ordinary no-quiet GetObject still succeeds in the negative mode'
+    local src_bytes
+    src_bytes=$(wc -c <"$src")
+    assert_eq "$(wc -c <"$body" | tr -d ' ')" "$(( src_bytes + 21 ))" \
+      'Y05: the negative-mode control still uses body+footer framing'
+    head -c "$src_bytes" "$body" >"$TMPROOT/y05-prefix"
+    cmp -s "$src" "$TMPROOT/y05-prefix" ||
+      { printf 'Y05: the negative-mode control body is not the exact source prefix\n'; return 1; }
+    printf 'Y05_ORDINARY_GET_CONTROL=PASS\n'
+
+    printf 'Y05_MISSING_QUIET_FAIL_CLOSED=PASS\n'
+  )
+}
+
+# Y06 — the ordinary corrected capability surface still PASSES, so Y05 is
+# specific to the missing quiet capability rather than a blanket rejection.
+y06() {
+  (
+    c13_arm_oss_env
+    M8_FAKE_OSS_CAPABILITY=full m8_oss_capability_guard - || return 1
+    printf 'Y06_CAPABILITY_PASS=PASS\n'
+  )
+}
+
+# Y07 — the existing synthetic M8_OSSUTIL_GET_OUTPUT_FLAG response-body seam is
+# preserved: the body stays byte-exact, is quiet-framed, and no client
+# diagnostics are appended to the response body.
+y07() {
+  (
+    c13_arm_oss_env
+    export M8_OSSUTIL_GET_OUTPUT_FLAG='--output'
+    local src="$TMPROOT/y07-src" out="$TMPROOT/y07-out"
+    printf 'seam payload\000with binary\377\n' >"$src"
+    c13_stage_key 'runs/y07/seam.bin' "$src"
+    m8_oss_get_object 'runs/y07/seam.bin' "$out" - || return 1
+    cmp -s "$src" "$out" || { printf 'Y07: the --output seam body is not byte-exact\n'; return 1; }
+    assert_eq "$(cat "$M8_FAKE_OSS_GET_LOG")" \
+      'operation=get-object seam=output quiet=yes' 'Y07: the seam is framed with --quiet'
+    assert_eq "$(sha256sum "$out" | cut -d' ' -f1)" "$(sha256sum "$src" | cut -d' ' -f1)" \
+      'Y07: seam SHA-256'
+    printf 'Y07_OUTPUT_SEAM_PRESERVED=PASS\n'
+  )
+}
+
+# Y08 — existing GetObject error semantics are preserved: absence, a non-absence
+# failure, temporary-file cleanup, rename install and tampered read-back.
+y08() {
+  (
+    c13_arm_oss_env
+    local out="$TMPROOT/y08-out" rc=0
+
+    # Absent object: M8_OSS_ABSENT, nothing installed, no temporary residue.
+    rc=0
+    m8_oss_get_object 'runs/y08/missing.txt' "$out" - || rc=$?
+    assert_eq "$rc" "$M8_OSS_ABSENT" 'Y08: absent object returns M8_OSS_ABSENT'
+    assert_no_file "$out"
+    assert_no_file "${out}.part"
+    assert_no_file "${out}.part.stderr"
+    assert_no_file "${out}.part.stdout"
+
+    # Success installs by rename and leaves no temporary residue.
+    local src="$TMPROOT/y08-src"
+    printf 'install-by-rename\n' >"$src"
+    c13_stage_key 'runs/y08/present.txt' "$src"
+    m8_oss_get_object 'runs/y08/present.txt' "$out" - || return 1
+    assert_file "$out"
+    cmp -s "$src" "$out" || { printf 'Y08: the rename install did not preserve bytes\n'; return 1; }
+    assert_no_file "${out}.part"
+    assert_no_file "${out}.part.stderr"
+
+    # A non-absence GetObject failure returns M8_OSS_ERROR and installs nothing.
+    local badbin="$TMPROOT/y08-bad-ossutil"
+    cat >"$badbin" <<'EOS'
+#!/usr/bin/env bash
+printf 'Error: InternalError: synthetic server failure\n' >&2
+exit 1
+EOS
+    chmod +x "$badbin"
+    rc=0
+    M8_OSSUTIL_BIN="$badbin" m8_oss_get_object 'runs/y08/present.txt' "$TMPROOT/y08-err" - || rc=$?
+    assert_eq "$rc" "$M8_OSS_ERROR" 'Y08: a non-absence get-object failure returns M8_OSS_ERROR'
+    assert_no_file "$TMPROOT/y08-err"
+
+    # Tampered read-back is detected by the digest check, never accepted.
+    local expected="$TMPROOT/y08-expected" tamper_src="$TMPROOT/y08-tamper-src"
+    printf 'authoritative-bytes\n' >"$expected"
+    c13_stage_key 'runs/y08/verify.txt' "$expected"
+    m8_oss_verify_object 'runs/y08/verify.txt' "$expected" - || return 1
+    printf 'tampered-bytes!\n' >"$tamper_src"
+    c13_stage_key 'runs/y08/verify.txt' "$tamper_src"
+    if m8_oss_verify_object 'runs/y08/verify.txt' "$expected" - 2>/dev/null; then
+      printf 'Y08: a tampered read-back was accepted\n'
+      return 1
+    fi
+    printf 'Y08_ERROR_SEMANTICS=PASS\n'
+  )
+}
+
+# ===========================================================================
 printf '===== M8-HSDR-F02 R2E-B01 + R2I-C1 offline verification =====\n'
 printf 'repo=%s\n' "$REPO_ROOT"
 
@@ -4154,6 +4457,16 @@ run_check r2i_c12 X25 'a misplaced declaration is rejected; leading whitespace f
 run_check r2i_c12 X26 'comment-only/PI-only documents and an encoding declaration are classified correctly' x26
 run_check r2i_c12 X27 'no prolog pre-processing, observable comments/PIs, exact footer match' x27
 
+printf '\n----- R2I-C13 GetObject byte-exactness regressions (Y01..Y08) -----\n'
+run_check r2i_c13 Y01 'no-quiet get-object stdout is body + deterministic elapsed footer (not byte-exact)' y01
+run_check r2i_c13 Y02 'production m8_oss_get_object frames GetObject with --quiet; --quiet is not a sixth pin' y02
+run_check r2i_c13 Y03 'text payload is byte-exact through production get-object' y03
+run_check r2i_c13 Y04 'arbitrary binary payload (NUL/CR/LF/DEL/0x80/0xFF) is byte-exact through production get-object' y04
+run_check r2i_c13 Y05 'no-get-object-quiet guards fail closed AND reject --quiet/-q at runtime while ordinary GetObject works' y05
+run_check r2i_c13 Y06 'ordinary corrected capability surface still passes' y06
+run_check r2i_c13 Y07 'the synthetic --output response-body seam stays byte-exact and quiet-framed' y07
+run_check r2i_c13 Y08 'absent/error/cleanup/rename/tampered-readback semantics preserved' y08
+
 printf '\n===== summary =====\n'
 printf 'R2E_B01_LEGACY_V01_V40=%s/%s\n' \
   "$((STATIC_PASS + SYNTH_PASS))" "$((STATIC_TOTAL + SYNTH_TOTAL))"
@@ -4165,6 +4478,7 @@ printf 'R2I_C4_B03_REGRESSIONS=%s/%s\n' "$R2I_C4_PASS" "$R2I_C4_TOTAL"
 printf 'R2I_C7_PROVIDER_BINARY_REGRESSIONS=%s/%s\n' "$R2I_C7_PASS" "$R2I_C7_TOTAL"
 printf 'R2I_C11_AUTH_PATH_REGRESSIONS=%s/%s\n' "$R2I_C11_PASS" "$R2I_C11_TOTAL"
 printf 'R2I_C12_VERSIONING_CLASSIFIER_REGRESSIONS=%s/%s\n' "$R2I_C12_PASS" "$R2I_C12_TOTAL"
+printf 'R2I_C13_GETOBJECT_BYTE_EXACTNESS_REGRESSIONS=%s/%s\n' "$R2I_C13_PASS" "$R2I_C13_TOTAL"
 if ((${#FAILED_CHECKS[@]})); then
   printf 'R2E_B01_OFFLINE_VERIFICATION=FAIL failed=%s\n' "${FAILED_CHECKS[*]}"
   exit 1

@@ -169,16 +169,27 @@ used. For an absolute path such as `/tmp/foo.tar.gz` the resulting argument is
 
 `HEAD`-then-unconditional-`PUT` is never used as the locking primitive, ETag is
 never treated as SHA-256, and `FileAlreadyExists` is never overwritten.
-`GetObject` stays byte-exact: response bytes travel directly from ossutil stdout
-into a file and never through shell command substitution or a shell variable.
-The manifest and archive digests are computed over those exact file bytes.
+
+`GetObject` stays byte-exact, but **not** because a bare stdout redirection is
+sufficient. The response body travels directly from ossutil stdout into a file
+and never through shell command substitution, a shell variable or a textual
+parser. On top of that, live ossutil **2.4.0** writes a **non-body** elapsed
+footer (`\n0.089713(s) elapsed\n`, 21 bytes) to ordinary `get-object` stdout, so
+a plain `> file` redirection is **not** byte-exact on its own. Production
+therefore frames the read with `get-object --quiet`, which live evidence
+established suppresses that client epilogue while leaving the response-body bytes
+identical. The manifest and archive digests are computed over those exact file
+bytes.
 
 The proof harness **never installs ossutil**; host provisioning supplies it. A
 capability guard must demonstrate support for
 `ossutil api put-object --forbid-overwrite true`, `get-object`, `head-object`,
 `get-bucket-versioning` and `get-bucket-location`, **and** for the five pinned
-global flags listed under *OSS trust target* below; otherwise the wrapper fails
-closed.
+global flags listed under *OSS trust target* below, **and** for the
+`get-object --quiet` response-framing flag; otherwise the wrapper fails closed.
+`--quiet` is a GetObject **framing/capability** requirement, **not** a sixth
+CLI-pinned trust target: it is never added to the pinned global vector, and a
+client that does not demonstrate it is rejected.
 
 ### OSS trust target (proof-tree role-bound config + CLI-pinned network target)
 
@@ -588,6 +599,7 @@ R2I_C1_REGRESSIONS=2/2
 R2I_C4_B03_REGRESSIONS=12/12
 R2I_C7_PROVIDER_BINARY_REGRESSIONS=4/4
 R2I_C11_AUTH_PATH_REGRESSIONS=18/18
+R2I_C13_GETOBJECT_BYTE_EXACTNESS_REGRESSIONS=8/8
 ```
 
 `T01..T12` are the R2I-C4/B03 trust-target regressions: the closed
@@ -610,6 +622,20 @@ an unknown flag; the CLI `--mode` valid set is exactly the captured live set
 the credential-free `Anonymous` parser value is exercised only at the parser, never
 as an auth path. Each is separately load-bearing: removing its production mechanism
 in a scratch copy makes that check fail.
+
+`Y01..Y08` are the R2I-C13 GetObject byte-exactness regressions. They model the
+exact live ossutil 2.4.0 framing in the synthetic client (a deterministic 21-byte
+`\n0.089713(s) elapsed\n` footer on ordinary stdout, suppressed by `--quiet`) and
+prove: plain no-quiet stdout redirection is **not** byte-exact; production
+`m8_oss_get_object` frames GetObject with `--quiet`; text and arbitrary binary
+payloads (NUL, CR, LF, DEL, `0x80`, `0xFF`) round-trip byte-exactly by `cmp`, byte
+count and SHA-256 without the body ever entering shell command substitution; a
+client that does not advertise `get-object --quiet` fails **closed** with the
+GetObject-quiet reason while the ordinary capability surface still passes; the
+existing `M8_OSSUTIL_GET_OUTPUT_FLAG` response-body seam stays byte-exact and
+quiet-framed; and absence, non-absence failure, temporary-file cleanup, rename
+install and tampered read-back semantics are preserved. `--quiet` remains outside
+the five pinned CLI trust-target arguments.
 
 ## Mutation boundary
 
