@@ -702,9 +702,15 @@ m8_prepare_oss_trust_profile() {
 # Evidence initialisation after a successful claim.
 # ---------------------------------------------------------------------------
 m8_write_invocation_context() {
-  local target=$1 nonce proof_tree
+  local target=$1 nonce nonce_sha256 proof_tree
   proof_tree="$(git -C "$M8_PROOF_ROOT" rev-parse HEAD^{tree})"
   nonce="$(head -c 32 /dev/urandom | sha256sum | cut -d' ' -f1)"
+  # R2I-C14: the runtime nonce stays process-local and is never persisted. Only
+  # SHA256(nonce) is written to the context, which is exactly what the adapter
+  # verifies: SHA256(M8_FORMAL_RUN_NONCE) == invocation_nonce_sha256. Persisting
+  # the raw nonce in a field named "_sha256" made every formal invocation fail
+  # context_invocation_nonce.
+  nonce_sha256="$(printf '%s' "$nonce" | sha256sum | cut -d' ' -f1)"
   M8_FORMAL_RUN_NONCE="$nonce"
   export M8_FORMAL_RUN_NONCE
 
@@ -725,7 +731,7 @@ m8_write_invocation_context() {
     printf 'run_prefix=%s\n' "$RUN_PREFIX"
     printf 'claim_object=%s\n' "$CLAIM_OBJECT"
     printf 'claim_sha256=%s\n' "$CLAIM_SHA256"
-    printf 'invocation_nonce_sha256=%s\n' "$nonce"
+    printf 'invocation_nonce_sha256=%s\n' "$nonce_sha256"
   } >"$target/formal-invocation-context.txt"
 
   M8_FORMAL_WRAPPER_CONTEXT="$target/formal-invocation-context.txt"

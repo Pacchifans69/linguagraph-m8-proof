@@ -44,6 +44,8 @@ R2I_C12_TOTAL=0
 R2I_C12_PASS=0
 R2I_C13_TOTAL=0
 R2I_C13_PASS=0
+R2I_C14_TOTAL=0
+R2I_C14_PASS=0
 declare -a FAILED_CHECKS=()
 
 run_check() {
@@ -58,6 +60,7 @@ run_check() {
     r2i_c11) R2I_C11_TOTAL=$((R2I_C11_TOTAL + 1)) ;;
     r2i_c12) R2I_C12_TOTAL=$((R2I_C12_TOTAL + 1)) ;;
     r2i_c13) R2I_C13_TOTAL=$((R2I_C13_TOTAL + 1)) ;;
+    r2i_c14) R2I_C14_TOTAL=$((R2I_C14_TOTAL + 1)) ;;
   esac
   out="$("$fn" 2>&1)" || rc=$?
   if (( rc == 0 )) && ! grep -q '^ASSERT_FAIL:' <<<"$out"; then
@@ -72,6 +75,7 @@ run_check() {
       r2i_c11) R2I_C11_PASS=$((R2I_C11_PASS + 1)) ;;
       r2i_c12) R2I_C12_PASS=$((R2I_C12_PASS + 1)) ;;
       r2i_c13) R2I_C13_PASS=$((R2I_C13_PASS + 1)) ;;
+      r2i_c14) R2I_C14_PASS=$((R2I_C14_PASS + 1)) ;;
     esac
   else
     printf 'FAIL [%-6s] %s %s\n' "$kind" "$id" "$desc"
@@ -4324,6 +4328,331 @@ EOS
 }
 
 # ===========================================================================
+# R2I-C14 — formal invocation nonce binding / pre-core RC capture (Z01..Z06).
+#
+# C13 formal-failure forensics (do not reinterpret): the wrapper persisted the RAW
+# runtime nonce as `invocation_nonce_sha256`, while the adapter verifies
+# SHA256(M8_FORMAL_RUN_NONCE) == invocation_nonce_sha256, so every formal
+# invocation died at `Mismatch: context_invocation_nonce`. Separately the adapter
+# installed its EXIT trap AFTER context_validate, so that failure left no numeric
+# adapter-exit-code.txt for the wrapper to capture.
+#
+# Z02..Z04 drive the REAL scripts/run-m8-proof-alibaba-ecs.sh through its real
+# context_validate logic. They never fabricate adapter-exit-code.txt,
+# formal-execution-rc.txt or outcome.txt to "prove" the handshake.
+# ===========================================================================
+
+# Build a temporary proof root holding the real adapter, the real libraries and a
+# core stub that records invocation. The real adapter refuses to run with any
+# synthetic seam set, so callers must launch it via `env -u` of the seven seams.
+c14_real_adapter_fixture() {
+  local root=$1
+  mkdir -p "$root/scripts/lib"
+  cp -a "$REPO_ROOT/scripts/lib/." "$root/scripts/lib/"
+  cp "$ADAPTER" "$root/scripts/run-m8-proof-alibaba-ecs.sh"
+  cat >"$root/scripts/run-m8-proof-core.sh" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+printf 'core-invoked\n' >>"${M8_CORE_SENTINEL:?}"
+EOF
+  mkdir -p "$root/proof-artifacts"
+}
+
+# Write a valid formal invocation context. $1=root $2=runtime nonce
+# [$3=persisted digest, defaulting to SHA256(runtime nonce)].
+c14_write_context() {
+  local root=$1 nonce=$2 persisted=${3:-}
+  local auth_sha proof_sha proof_tree claim_sha
+  auth_sha="$(printf 'z-token' | sha256sum | cut -d' ' -f1)"
+  proof_sha='8c28875286cbf4170c1e67eea4948f0218be738f'
+  proof_tree='9803f77a64493e47c28a3e47d96ad98dc5b65c3e'
+  claim_sha="$(printf 'z-claim' | sha256sum | cut -d' ' -f1)"
+  [[ -n "$persisted" ]] || persisted="$(printf '%s' "$nonce" | sha256sum | cut -d' ' -f1)"
+  {
+    printf 'schema=linguagraph-m8-formal-invocation-context/v1\n'
+    printf 'formal_entrypoint=scripts/run-m8-proof.sh\n'
+    printf 'authorization_kind=SEMANTIC\n'
+    printf 'authorization_sha256=%s\n' "$auth_sha"
+    printf 'semantic_auth_sha256=%s\n' "$auth_sha"
+    printf 'proof_sha=%s\n' "$proof_sha"
+    printf 'proof_tree=%s\n' "$proof_tree"
+    printf 'candidate_sha=2441f9cf60b7cc9402c5b257be010b559b39b717\n'
+    printf 'candidate_tree=5d1b7c7cc104cd365b0ea629d9ead7677d17f2be\n'
+    printf 'candidate_parent=e4b1cc66f540ab74c0ef9bd014b0a0da3a2d9c1d\n'
+    printf 'frozen_main=cf26ea557bd746a518ff32b8b7e7a7542be7f7ae\n'
+    printf 'authorized_executor_id=alibaba-ecs:i-j6c9854oyawy89fcdxy2\n'
+    printf 'executor_id=alibaba-ecs:i-j6c9854oyawy89fcdxy2\n'
+    printf 'run_prefix=runs/%s/%s\n' "$proof_sha" "$auth_sha"
+    printf 'claim_object=authorizations/%s/claim.json\n' "$auth_sha"
+    printf 'claim_sha256=%s\n' "$claim_sha"
+    printf 'invocation_nonce_sha256=%s\n' "$persisted"
+  } >"$root/proof-artifacts/formal-invocation-context.txt"
+}
+
+# Run the real adapter with the seven seams unset and no OSS bucket configured, so
+# a successful context_validate is followed by a deterministic PRE-NETWORK failure
+# at claim verification. $1=root $2=runtime nonce $3=stdout file; prints the rc.
+c14_run_real_adapter() {
+  local root=$1 nonce=$2 out=$3 rc=0
+  env -u M8_SYNTHETIC_TEST_MODE -u M8_IMDS_BASE_URL -u M8_IMDS_CURL_BIN \
+    -u M8_OSSUTIL_BIN -u M8_OSSUTIL_GET_OUTPUT_FLAG \
+    -u M8_ADAPTER_SCRIPT_OVERRIDE -u M8_PYTHON_BIN -u M8_OSS_BUCKET \
+    M8_PROOF_ROOT="$root" \
+    M8_FORMAL_WRAPPER_CONTEXT="$root/proof-artifacts/formal-invocation-context.txt" \
+    M8_FORMAL_RUN_NONCE="$nonce" \
+    M8_PROOF_RUN_AUTHORIZATION='z-token' \
+    APPROVED_PROOF_SHA='8c28875286cbf4170c1e67eea4948f0218be738f' \
+    M8_CORE_SENTINEL="$root/core-invoked.sentinel" \
+    bash "$root/scripts/run-m8-proof-alibaba-ecs.sh" >"$out" 2>&1 || rc=$?
+  printf '%s' "$rc"
+}
+
+# Assert the real EXIT trap left a numeric adapter-exit-code.txt.
+c14_assert_numeric_adapter_rc() {
+  local root=$1 label=$2 code
+  code="$(cat "$root/proof-artifacts/adapter-exit-code.txt" 2>/dev/null || printf '')"
+  [[ "$code" =~ ^[0-9]+$ ]] ||
+    { printf '%s: the real EXIT trap produced no numeric adapter-exit-code.txt (got %q)\n' "$label" "$code"; return 1; }
+}
+
+# Line number (1-based) of the first adapter line containing a literal pattern.
+c14_adapter_line() {
+  grep -n -F -- "$1" "$ADAPTER" | head -n1 | cut -d: -f1
+}
+
+# Require a located adapter line to be a real line number strictly before the trap.
+c14_assert_before() {
+  local label=$1 line=$2 trap_line=$3
+  [[ "$line" =~ ^[0-9]+$ ]] ||
+    { printf 'Z05: could not locate %s in the adapter\n' "$label"; return 1; }
+  (( line < trap_line )) ||
+    { printf 'Z05: %s is not before the EXIT trap (line=%s trap=%s)\n' "$label" "$line" "$trap_line"; return 1; }
+}
+
+# Z01 — the wrapper persists only SHA256(runtime nonce); the raw nonce stays
+# process-local and never reaches the context file.
+z01() {
+  local sb target persisted runtime expect
+  sb="$(mktemp -d "$TMPROOT/z01.XXXXXX")"
+  target="$sb/evidence"
+  mkdir -p "$target" "$sb/scripts"
+  cp -a "$REPO_ROOT/scripts/lib" "$sb/scripts/lib"
+  git -C "$sb" init -q
+  git -C "$sb" add -A >/dev/null 2>&1 || true
+  GIT_AUTHOR_NAME=fixture GIT_AUTHOR_EMAIL=fixture@example.invalid \
+    GIT_COMMITTER_NAME=fixture GIT_COMMITTER_EMAIL=fixture@example.invalid \
+    git -C "$sb" commit -qm 'z01 fixture' >/dev/null 2>&1 || true
+  (
+    # shellcheck source=/dev/null
+    source "$WRAPPER"
+    export M8_PROOF_ROOT="$sb"
+    export M8_EXECUTOR_ID="$M8_PROVIDER_EXECUTOR_ID"
+    AUTHORIZATION_KIND='SEMANTIC'
+    AUTHORIZATION_SHA256="$(printf 'z01-token' | sha256sum | cut -d' ' -f1)"
+    SEMANTIC_AUTH_SHA256="$AUTHORIZATION_SHA256"
+    APPROVED_PROOF_SHA="$(git -C "$sb" rev-parse HEAD)"
+    export APPROVED_PROOF_SHA
+    RUN_PREFIX="runs/$APPROVED_PROOF_SHA/$SEMANTIC_AUTH_SHA256"
+    CLAIM_OBJECT="authorizations/$AUTHORIZATION_SHA256/claim.json"
+    CLAIM_SHA256="$(printf 'z01-claim' | sha256sum | cut -d' ' -f1)"
+    m8_write_invocation_context "$target" || return 1
+
+    persisted="$(sed -n 's/^invocation_nonce_sha256=//p' "$target/formal-invocation-context.txt")"
+    runtime="${M8_FORMAL_RUN_NONCE:-}"
+    [[ -n "$runtime" ]] || { printf 'Z01: the runtime nonce is absent\n'; return 1; }
+    [[ "$runtime" =~ ^[0-9a-f]{64}$ ]] || { printf 'Z01: the runtime nonce is not SHA-256 shaped\n'; return 1; }
+    expect="$(printf '%s' "$runtime" | sha256sum | cut -d' ' -f1)"
+    assert_eq "$persisted" "$expect" 'Z01: persisted invocation_nonce_sha256 is SHA256(runtime nonce)'
+    [[ "$persisted" != "$runtime" ]] ||
+      { printf 'Z01: the raw runtime nonce was persisted as the _sha256 value\n'; return 1; }
+    if grep -Fq "$runtime" "$target/formal-invocation-context.txt"; then
+      printf 'Z01: the raw runtime nonce leaked into the persisted context\n'
+      return 1
+    fi
+    printf 'Z01_NONCE_BINDING=PASS\n'
+  )
+}
+
+# Z02 — GENUINE production integration: the REAL wrapper writer
+# (m8_write_invocation_context) produces the context, and the REAL adapter then
+# validates that exact context against the exact live runtime nonce, in one
+# process environment. The success path must NOT come from the hand-written
+# c14_write_context helper (that helper is used only by the Z03/Z04 tamper tests).
+z02() {
+  local root="$TMPROOT/z02-proof" out="$TMPROOT/z02.out" inner="$TMPROOT/z02-inner.sh" head_sha rc
+  c14_real_adapter_fixture "$root"
+  # A real git proof root is required: the real writer resolves HEAD^{tree}.
+  git -C "$root" init -q
+  git -C "$root" add -A >/dev/null 2>&1 || true
+  GIT_AUTHOR_NAME=fixture GIT_AUTHOR_EMAIL=fixture@example.invalid \
+    GIT_COMMITTER_NAME=fixture GIT_COMMITTER_EMAIL=fixture@example.invalid \
+    git -C "$root" commit -qm 'z02 fixture' >/dev/null 2>&1 || true
+  head_sha="$(git -C "$root" rev-parse HEAD)"
+
+  # The inner shell sources the REAL wrapper, invokes the REAL writer, and in the
+  # SAME process environment runs the REAL adapter. The raw nonce never leaves the
+  # process environment (the writer exports M8_FORMAL_RUN_NONCE); it is never
+  # written to a helper file.
+  cat >"$inner" <<'EOS'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+root=$1; out=$2; wrapper=$3
+export M8_PROOF_ROOT="$root"
+export M8_CORE_SENTINEL="$root/core-invoked.sentinel"
+# shellcheck source=/dev/null
+source "$wrapper"
+export APPROVED_PROOF_SHA="$(git -C "$root" rev-parse HEAD)"
+export M8_EXECUTOR_ID="$M8_PROVIDER_EXECUTOR_ID"
+token_sha="$(printf 'z02-token' | sha256sum | cut -d' ' -f1)"
+AUTHORIZATION_KIND='SEMANTIC'
+AUTHORIZATION_SHA256="$token_sha"
+SEMANTIC_AUTH_SHA256="$token_sha"
+RUN_PREFIX="runs/$APPROVED_PROOF_SHA/$SEMANTIC_AUTH_SHA256"
+CLAIM_OBJECT="authorizations/$AUTHORIZATION_SHA256/claim.json"
+CLAIM_SHA256="$(printf 'z02-claim' | sha256sum | cut -d' ' -f1)"
+mkdir -p "$root/proof-artifacts"
+# REAL writer: creates the context and exports the raw runtime nonce in-process.
+m8_write_invocation_context "$root/proof-artifacts"
+rc=0
+bash "$root/scripts/run-m8-proof-alibaba-ecs.sh" >"$out" 2>&1 || rc=$?
+printf '%s' "$rc"
+EOS
+
+  rc="$(env -u M8_SYNTHETIC_TEST_MODE -u M8_IMDS_BASE_URL -u M8_IMDS_CURL_BIN \
+    -u M8_OSSUTIL_BIN -u M8_OSSUTIL_GET_OUTPUT_FLAG \
+    -u M8_ADAPTER_SCRIPT_OVERRIDE -u M8_PYTHON_BIN -u M8_OSS_BUCKET \
+    M8_PROOF_RUN_AUTHORIZATION='z02-token' \
+    bash "$inner" "$root" "$out" "$WRAPPER")"
+
+  (( rc != 0 )) || { printf 'Z02: the real adapter unexpectedly succeeded\n'; return 1; }
+  # The context must have been produced by the REAL writer, not the helper.
+  grep -Fq "proof_sha=$head_sha" "$root/proof-artifacts/formal-invocation-context.txt" ||
+    { printf 'Z02: the context was not produced by the real wrapper writer\n'; return 1; }
+  if grep -Fq 'context_invocation_nonce' "$out"; then
+    printf 'Z02: the real writer->adapter handshake still failed context_invocation_nonce\n'
+    return 1
+  fi
+  grep -Fq 'OSS bucket configuration is required for formal execution' "$out" ||
+    { printf 'Z02: the adapter did not progress beyond context_validate:\n%s\n' "$(cat "$out")"; return 1; }
+  grep -Fq 'adapter_mode=FORMAL' "$root/proof-artifacts/adapter-provenance.txt" 2>/dev/null ||
+    { printf 'Z02: the adapter never recorded FORMAL adapter mode\n'; return 1; }
+  assert_no_file "$root/core-invoked.sentinel"
+  c14_assert_numeric_adapter_rc "$root" 'Z02' || return 1
+  printf 'Z02_REAL_HANDSHAKE=PASS\n'
+}
+
+# Z03 — persisted digest binds nonce A while the runtime presents nonce B.
+z03() {
+  local root="$TMPROOT/z03-proof" out="$TMPROOT/z03.out" nonce_a nonce_b rc
+  c14_real_adapter_fixture "$root"
+  nonce_a="$(printf 'z03-nonce-A' | sha256sum | cut -d' ' -f1)"
+  nonce_b="$(printf 'z03-nonce-B' | sha256sum | cut -d' ' -f1)"
+  c14_write_context "$root" "$nonce_a"
+  rc="$(c14_run_real_adapter "$root" "$nonce_b" "$out")"
+  (( rc != 0 )) || { printf 'Z03: a tampered runtime nonce was accepted\n'; return 1; }
+  grep -Fq 'context_invocation_nonce' "$out" ||
+    { printf 'Z03: the runtime-nonce tamper did not fail context_invocation_nonce:\n%s\n' "$(cat "$out")"; return 1; }
+  assert_no_file "$root/core-invoked.sentinel"
+  if grep -Fq 'adapter_mode=FORMAL' "$root/proof-artifacts/adapter-provenance.txt" 2>/dev/null; then
+    printf 'Z03: the adapter reached FORMAL mode despite a nonce mismatch\n'
+    return 1
+  fi
+  c14_assert_numeric_adapter_rc "$root" 'Z03' || return 1
+  printf 'Z03_TAMPERED_RUNTIME_NONCE=PASS\n'
+}
+
+# Z04 — the runtime nonce is correct but the persisted digest was altered.
+z04() {
+  local root="$TMPROOT/z04-proof" out="$TMPROOT/z04.out" nonce wrong rc
+  c14_real_adapter_fixture "$root"
+  nonce="$(printf 'z04-nonce-correct' | sha256sum | cut -d' ' -f1)"
+  wrong="$(printf 'z04-nonce-wrong' | sha256sum | cut -d' ' -f1)"
+  c14_write_context "$root" "$nonce" "$wrong"
+  rc="$(c14_run_real_adapter "$root" "$nonce" "$out")"
+  (( rc != 0 )) || { printf 'Z04: a tampered persisted nonce digest was accepted\n'; return 1; }
+  grep -Fq 'context_invocation_nonce' "$out" ||
+    { printf 'Z04: the persisted-digest tamper did not fail context_invocation_nonce:\n%s\n' "$(cat "$out")"; return 1; }
+  assert_no_file "$root/core-invoked.sentinel"
+  if grep -Fq 'adapter_mode=FORMAL' "$root/proof-artifacts/adapter-provenance.txt" 2>/dev/null; then
+    printf 'Z04: the adapter reached FORMAL mode despite a digest mismatch\n'
+    return 1
+  fi
+  c14_assert_numeric_adapter_rc "$root" 'Z04' || return 1
+  printf 'Z04_TAMPERED_PERSISTED_DIGEST=PASS\n'
+}
+
+# Z05 — static ordering. There must be exactly ONE `trap adapter_finalize EXIT`,
+# and EVERY formal-entry eligibility boundary must precede it, with
+# adapter_finalize defined < trap < context_validate < core invocation.
+z05() {
+  local trap_count trap_line ctx_line core_line def_line
+  trap_count="$(grep -c -F 'trap adapter_finalize EXIT' "$ADAPTER")"
+  assert_eq "$trap_count" '1' 'Z05: exactly one adapter_finalize EXIT trap installation'
+  trap_line="$(c14_adapter_line 'trap adapter_finalize EXIT')"
+  [[ "$trap_line" =~ ^[0-9]+$ ]] || { printf 'Z05: the EXIT trap was not located\n'; return 1; }
+
+  local seam_line root_line presence_line path_line ctxfile_line evid_line
+  local corefile_line redir_line circle_line
+  seam_line="$(c14_adapter_line 'm8_reject_synthetic_overrides ||')"
+  root_line="$(c14_adapter_line 'the proof repository root could not be resolved')"
+  presence_line="$(c14_adapter_line '[[ -n "${M8_FORMAL_WRAPPER_CONTEXT:-}" ]] ||')"
+  path_line="$(c14_adapter_line '[[ "$M8_FORMAL_WRAPPER_CONTEXT" == "$CONTEXT_FILE" ]] ||')"
+  ctxfile_line="$(c14_adapter_line '[[ -f "$CONTEXT_FILE" ]] ||')"
+  evid_line="$(c14_adapter_line '[[ -d "$EVIDENCE" ]] ||')"
+  corefile_line="$(c14_adapter_line 'semantic core is missing')"
+  redir_line="$(c14_adapter_line 'M8_PROOF_EVIDENCE_DIR must be unset or exactly')"
+  circle_line="$(c14_adapter_line 'for v in CIRCLE_PROJECT_USERNAME')"
+
+  c14_assert_before 'the synthetic-seam rejection' "$seam_line" "$trap_line" || return 1
+  c14_assert_before 'the resolved proof-root guard' "$root_line" "$trap_line" || return 1
+  c14_assert_before 'the wrapper-context presence guard' "$presence_line" "$trap_line" || return 1
+  c14_assert_before 'the wrapper-context path-equality guard' "$path_line" "$trap_line" || return 1
+  c14_assert_before 'the context-file existence guard' "$ctxfile_line" "$trap_line" || return 1
+  c14_assert_before 'the evidence-directory existence guard' "$evid_line" "$trap_line" || return 1
+  c14_assert_before 'the semantic-core existence guard' "$corefile_line" "$trap_line" || return 1
+  c14_assert_before 'the evidence-redirection rejection' "$redir_line" "$trap_line" || return 1
+  c14_assert_before 'the CircleCI spoof rejection' "$circle_line" "$trap_line" || return 1
+
+  def_line="$(c14_adapter_line 'adapter_finalize() {')"
+  ctx_line="$(grep -n -x -F 'context_validate' "$ADAPTER" | head -n1 | cut -d: -f1)"
+  core_line="$(c14_adapter_line 'bash "$CORE" || CORE_RC=$?')"
+  c14_assert_before 'the adapter_finalize definition' "$def_line" "$trap_line" || return 1
+  [[ "$ctx_line" =~ ^[0-9]+$ ]] || { printf 'Z05: the context_validate invocation was not located\n'; return 1; }
+  [[ "$core_line" =~ ^[0-9]+$ ]] || { printf 'Z05: the core invocation was not located\n'; return 1; }
+  (( trap_line < ctx_line )) ||
+    { printf 'Z05: the EXIT trap is not installed before context_validate (trap=%s ctx=%s)\n' "$trap_line" "$ctx_line"; return 1; }
+  (( ctx_line < core_line )) ||
+    { printf 'Z05: context_validate is not before the core invocation (ctx=%s core=%s)\n' "$ctx_line" "$core_line"; return 1; }
+  printf 'Z05_TRAP_ORDERING=PASS\n'
+}
+
+# Z06 — a direct NONFORMAL invocation still refuses before any trap exists and
+# creates no formal adapter RC/evidence state.
+z06() {
+  local root="$TMPROOT/z06-proof" out="$TMPROOT/z06.out" rc=0 sentinel="$TMPROOT/z06-core.sentinel"
+  c14_real_adapter_fixture "$root"
+  rm -rf "$root/proof-artifacts"
+  rm -f "$sentinel"
+  env -u M8_SYNTHETIC_TEST_MODE -u M8_IMDS_BASE_URL -u M8_IMDS_CURL_BIN \
+    -u M8_OSSUTIL_BIN -u M8_OSSUTIL_GET_OUTPUT_FLAG \
+    -u M8_ADAPTER_SCRIPT_OVERRIDE -u M8_PYTHON_BIN \
+    -u M8_FORMAL_WRAPPER_CONTEXT -u M8_FORMAL_RUN_NONCE \
+    M8_PROOF_ROOT="$root" M8_CORE_SENTINEL="$sentinel" \
+    bash "$root/scripts/run-m8-proof-alibaba-ecs.sh" >"$out" 2>&1 || rc=$?
+  (( rc != 0 )) || { printf 'Z06: a direct NONFORMAL adapter invocation succeeded\n'; return 1; }
+  assert_contains "$out" 'M8_ADAPTER_MODE=NONFORMAL'
+  assert_contains "$out" 'M8_FORMAL_STATUS=NOT_APPLICABLE'
+  assert_no_file "$sentinel"
+  assert_no_file "$root/proof-artifacts"
+  assert_no_file "$root/candidate"
+  local residue
+  residue="$(find "$root" \( -name 'adapter-exit-code.txt' -o -name 'formal-execution-rc.txt' -o -name 'outcome.txt' \) -print 2>/dev/null)"
+  [[ -z "$residue" ]] ||
+    { printf 'Z06: a NONFORMAL invocation created formal RC state: %s\n' "$residue"; return 1; }
+  printf 'Z06_NONFORMAL_PRESERVED=PASS\n'
+}
+
+# ===========================================================================
 printf '===== M8-HSDR-F02 R2E-B01 + R2I-C1 offline verification =====\n'
 printf 'repo=%s\n' "$REPO_ROOT"
 
@@ -4467,6 +4796,14 @@ run_check r2i_c13 Y06 'ordinary corrected capability surface still passes' y06
 run_check r2i_c13 Y07 'the synthetic --output response-body seam stays byte-exact and quiet-framed' y07
 run_check r2i_c13 Y08 'absent/error/cleanup/rename/tampered-readback semantics preserved' y08
 
+printf '\n----- R2I-C14 formal invocation nonce / pre-core RC regressions (Z01..Z06) -----\n'
+run_check r2i_c14 Z01 'wrapper persists SHA256(runtime nonce); the raw nonce stays process-local' z01
+run_check r2i_c14 Z02 'real wrapper writer -> real adapter: generated context validates and stops pre-network with a numeric RC' z02
+run_check r2i_c14 Z03 'tampered runtime nonce fails context_invocation_nonce with a numeric adapter RC' z03
+run_check r2i_c14 Z04 'tampered persisted nonce digest fails context_invocation_nonce with a numeric adapter RC' z04
+run_check r2i_c14 Z05 'exactly one EXIT trap, after every eligibility boundary and before context_validate/core' z05
+run_check r2i_c14 Z06 'direct NONFORMAL invocation still refuses and creates no adapter RC state' z06
+
 printf '\n===== summary =====\n'
 printf 'R2E_B01_LEGACY_V01_V40=%s/%s\n' \
   "$((STATIC_PASS + SYNTH_PASS))" "$((STATIC_TOTAL + SYNTH_TOTAL))"
@@ -4479,6 +4816,7 @@ printf 'R2I_C7_PROVIDER_BINARY_REGRESSIONS=%s/%s\n' "$R2I_C7_PASS" "$R2I_C7_TOTA
 printf 'R2I_C11_AUTH_PATH_REGRESSIONS=%s/%s\n' "$R2I_C11_PASS" "$R2I_C11_TOTAL"
 printf 'R2I_C12_VERSIONING_CLASSIFIER_REGRESSIONS=%s/%s\n' "$R2I_C12_PASS" "$R2I_C12_TOTAL"
 printf 'R2I_C13_GETOBJECT_BYTE_EXACTNESS_REGRESSIONS=%s/%s\n' "$R2I_C13_PASS" "$R2I_C13_TOTAL"
+printf 'R2I_C14_FORMAL_CONTEXT_REGRESSIONS=%s/%s\n' "$R2I_C14_PASS" "$R2I_C14_TOTAL"
 if ((${#FAILED_CHECKS[@]})); then
   printf 'R2E_B01_OFFLINE_VERIFICATION=FAIL failed=%s\n' "${FAILED_CHECKS[*]}"
   exit 1

@@ -246,9 +246,20 @@ adapter_finalize() {
   exit "$exit_code"
 }
 
+# R2I-C14: install the adapter's EXIT trap BEFORE context_validate. A
+# formal-context validation failure must still leave the adapter's own numeric
+# adapter-exit-code.txt, which the wrapper captures and cross-checks; installing
+# the trap after validation meant a validation failure (e.g. the
+# context_invocation_nonce mismatch) produced no adapter RC record at all.
+#
+# The trap is installed only here -- after every formal-entry eligibility guard
+# above (resolved proof root; fixed EVIDENCE path; EVIDENCE/context/core existence;
+# wrapper-context path equality; CircleCI spoof rejection) and after
+# adapter_finalize is defined -- so a direct NONFORMAL invocation still exits
+# through nonformal_refuse before any trap exists and creates no host state.
+trap adapter_finalize EXIT
 context_validate
 mkdir -p "$EVIDENCE" || die "cannot create $EVIDENCE"
-trap adapter_finalize EXIT
 record adapter_mode "$M8_ADAPTER_MODE"
 record authorization_kind "$AUTHORIZATION_KIND"
 record authorization_sha256 "$AUTHORIZATION_SHA"
