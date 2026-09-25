@@ -46,6 +46,8 @@ R2I_C13_TOTAL=0
 R2I_C13_PASS=0
 R2I_C14_TOTAL=0
 R2I_C14_PASS=0
+R2I_C15_TOTAL=0
+R2I_C15_PASS=0
 declare -a FAILED_CHECKS=()
 
 run_check() {
@@ -61,6 +63,7 @@ run_check() {
     r2i_c12) R2I_C12_TOTAL=$((R2I_C12_TOTAL + 1)) ;;
     r2i_c13) R2I_C13_TOTAL=$((R2I_C13_TOTAL + 1)) ;;
     r2i_c14) R2I_C14_TOTAL=$((R2I_C14_TOTAL + 1)) ;;
+    r2i_c15) R2I_C15_TOTAL=$((R2I_C15_TOTAL + 1)) ;;
   esac
   out="$("$fn" 2>&1)" || rc=$?
   if (( rc == 0 )) && ! grep -q '^ASSERT_FAIL:' <<<"$out"; then
@@ -76,6 +79,7 @@ run_check() {
       r2i_c12) R2I_C12_PASS=$((R2I_C12_PASS + 1)) ;;
       r2i_c13) R2I_C13_PASS=$((R2I_C13_PASS + 1)) ;;
       r2i_c14) R2I_C14_PASS=$((R2I_C14_PASS + 1)) ;;
+      r2i_c15) R2I_C15_PASS=$((R2I_C15_PASS + 1)) ;;
     esac
   else
     printf 'FAIL [%-6s] %s %s\n' "$kind" "$id" "$desc"
@@ -4653,6 +4657,150 @@ z06() {
 }
 
 # ===========================================================================
+# R2I-C15 — adapter canonical proof-root propagation (W01).
+#
+# C14 hosted failure forensics (do not reinterpret): the wrapper resolved
+# M8_PROOF_ROOT as an unexported shell variable, so the adapter child never saw
+# it. The adapter then resolved its own PROOF_ROOT from git but did NOT publish it
+# back into M8_PROOF_ROOT, so the first proof-root-dependent OSS helper call died
+# with "M8_PROOF_ROOT is not set; cannot resolve the canonical OSS config" inside
+# m8_oss_canonical_config_guard, before any adapter OSS network request and before
+# the claim read-back. The semantic core was never invoked.
+#
+# The C14 fixtures could not catch this because they explicitly supply
+# M8_PROOF_ROOT to the adapter. W01 reproduces the real hosted environment gap:
+# M8_PROOF_ROOT is ABSENT at adapter launch and the adapter must self-resolve.
+# ===========================================================================
+
+# Real proof-tree fixture for the C15 regression: real adapter, real libraries,
+# the frozen canonical OSS config, a core sentinel stub, and a real git root.
+c15_real_adapter_fixture() {
+  local root=$1
+  mkdir -p "$root/scripts/lib" "$root/scripts/config" "$root/proof-artifacts"
+  cp -a "$REPO_ROOT/scripts/lib/." "$root/scripts/lib/"
+  cp "$ADAPTER" "$root/scripts/run-m8-proof-alibaba-ecs.sh"
+  cp "$REPO_ROOT/scripts/config/m8-ossutil-formal.ini" "$root/scripts/config/m8-ossutil-formal.ini"
+  cat >"$root/scripts/run-m8-proof-core.sh" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+printf 'core-invoked\n' >>"${M8_CORE_SENTINEL:?}"
+EOF
+  git -C "$root" init -q
+  git -C "$root" add -A >/dev/null 2>&1 || true
+  GIT_AUTHOR_NAME=fixture GIT_AUTHOR_EMAIL=fixture@example.invalid \
+    GIT_COMMITTER_NAME=fixture GIT_COMMITTER_EMAIL=fixture@example.invalid \
+    git -C "$root" commit -qm 'c15 fixture' >/dev/null 2>&1 || true
+}
+
+# W01 — with M8_PROOF_ROOT ABSENT at launch and the adapter started from inside its
+# own proof tree, the adapter must self-resolve the proof root, publish it, and
+# therefore advance PAST the historical proof-root propagation failure into the
+# intended later pre-network fail-closed diagnostic. No OSS/provider access.
+w01() {
+  local root="$TMPROOT/c15-proof" out="$TMPROOT/c15.out" nonce rc=0
+  local pathdir="$TMPROOT/c15-bin" ossutil_sentinel="$TMPROOT/c15-ossutil-invoked"
+  local curl_sentinel="$TMPROOT/c15-curl-invoked"
+  c15_real_adapter_fixture "$root"
+
+  # PATH-only client stubs. The production-forbidden M8_OSSUTIL_BIN and
+  # M8_IMDS_CURL_BIN synthetic seams are deliberately NOT set, so the real code
+  # would resolve `ossutil` and `curl` from PATH. Both stubs record any invocation:
+  # that is the explicit proof that no OSS client AND no IMDS/provider client was
+  # ever reached in this fail-closed path.
+  mkdir -p "$pathdir"
+  cat >"$pathdir/ossutil" <<'EOF'
+#!/usr/bin/env bash
+printf 'ossutil-stub-invoked\n' >>"${C15_OSSUTIL_SENTINEL:?}"
+printf 'synthetic ossutil: no operation performed\n'
+exit 0
+EOF
+  cat >"$pathdir/curl" <<'EOF'
+#!/usr/bin/env bash
+printf 'curl-stub-invoked\n' >>"${C15_CURL_SENTINEL:?}"
+exit 22
+EOF
+  chmod +x "$pathdir/ossutil" "$pathdir/curl"
+  rm -f "$ossutil_sentinel" "$curl_sentinel"
+
+  nonce="$(printf 'c15-nonce' | sha256sum | cut -d' ' -f1)"
+  c14_write_context "$root" "$nonce"
+  assert_file "$root/scripts/config/m8-ossutil-formal.ini"
+
+  # Launch from INSIDE the fixture with M8_PROOF_ROOT explicitly removed, so the
+  # adapter must resolve the root itself via `git rev-parse --show-toplevel`.
+  (
+    cd "$root" || exit 1
+    env -u M8_PROOF_ROOT -u M8_OSS_ECS_ROLE_NAME -u M8_SYNTHETIC_TEST_MODE \
+      -u M8_IMDS_BASE_URL -u M8_IMDS_CURL_BIN -u M8_OSSUTIL_BIN \
+      -u M8_OSSUTIL_GET_OUTPUT_FLAG -u M8_ADAPTER_SCRIPT_OVERRIDE -u M8_PYTHON_BIN \
+      -u M8_PROOF_EVIDENCE_DIR \
+      PATH="$pathdir:$PATH" \
+      M8_OSS_BUCKET='test-bucket' \
+      M8_FORMAL_WRAPPER_CONTEXT="$root/proof-artifacts/formal-invocation-context.txt" \
+      M8_FORMAL_RUN_NONCE="$nonce" \
+      M8_PROOF_RUN_AUTHORIZATION='z-token' \
+      APPROVED_PROOF_SHA='8c28875286cbf4170c1e67eea4948f0218be738f' \
+      M8_CORE_SENTINEL="$root/core-invoked.sentinel" \
+      C15_OSSUTIL_SENTINEL="$ossutil_sentinel" \
+      C15_CURL_SENTINEL="$curl_sentinel" \
+      bash "$root/scripts/run-m8-proof-alibaba-ecs.sh" >"$out" 2>&1
+  ) || rc=$?
+
+  (( rc != 0 )) || { printf 'W01: the adapter unexpectedly succeeded\n'; return 1; }
+
+  # The claim read-back OSS log is the exact production locus where the historical
+  # hosted failure was recorded.
+  local osslog="$root/proof-artifacts/adapter-oss.log"
+  assert_file "$osslog"
+
+  # A. The historical proof-root propagation failure locus must be GONE, in the
+  #    adapter stream AND in the OSS log.
+  if grep -Fq 'M8_PROOF_ROOT is not set; cannot resolve the canonical OSS config' "$out" "$osslog"; then
+    printf 'W01: the historical M8_PROOF_ROOT propagation failure is still present:\n%s\n%s\n' \
+      "$(cat "$out")" "$(cat "$osslog")"
+    return 1
+  fi
+  # The canonical config must genuinely have been resolved (not merely "not errored").
+  if grep -Fq 'canonical OSS config is absent' "$out" "$osslog"; then
+    printf 'W01: the adapter did not resolve the canonical config from its own root:\n%s\n' "$(cat "$osslog")"
+    return 1
+  fi
+
+  # B. Execution must have advanced to the intended later pre-network fail-closed
+  #    diagnostic: the observed ECS role binding has not been established.
+  grep -Fq 'observed ECS RAM role name is not established; refusing any OSS call' "$osslog" ||
+    { printf 'W01: the intended later pre-network diagnostic is absent from the OSS log:\n%s\n' "$(cat "$osslog")"; return 1; }
+  # ...and the read-back must have been attempted through the canonical root path.
+  grep -Fq 'get_object key=authorizations/' "$osslog" ||
+    { printf 'W01: no claim read-back attempt was logged:\n%s\n' "$(cat "$osslog")"; return 1; }
+
+  # fail-closed progression, core never invoked, and no OSS client AND no
+  # IMDS/provider client ever reached (PATH-only sentinels)
+  assert_no_file "$root/core-invoked.sentinel"
+  assert_no_file "$ossutil_sentinel"
+  assert_no_file "$curl_sentinel"
+  c14_assert_numeric_adapter_rc "$root" 'W01' || return 1
+  local code
+  code="$(cat "$root/proof-artifacts/adapter-exit-code.txt")"
+  [[ "$code" != '0' ]] || { printf 'W01: the adapter reported RC 0 on a fail-closed path\n'; return 1; }
+
+  # no durable artifact of any canonical kind was created by this regression,
+  # including the canonical archive (+ sidecar) and the closure-receipt readback
+  local residue
+  residue="$(find "$root" \( \
+    -name 'claim.json' -o -name 'claim-adapter-readback.json' \
+    -o -name 'closure-receipt.json' -o -name 'closure-receipt.readback.json' \
+    -o -name 'closure-receipt-check.json' -o -name 'existing-closure-receipt.json' \
+    -o -name 'package-index.json' \
+    -o -name 'm8-proof-artifacts-*.tar.gz' -o -name 'm8-proof-artifacts-*.tar.gz.sha256' \
+    \) -print 2>/dev/null)"
+  [[ -z "$residue" ]] ||
+    { printf 'W01: the regression created durable-looking objects: %s\n' "$residue"; return 1; }
+
+  printf 'W01_ADAPTER_ROOT_PROPAGATION=PASS\n'
+}
+
+# ===========================================================================
 printf '===== M8-HSDR-F02 R2E-B01 + R2I-C1 offline verification =====\n'
 printf 'repo=%s\n' "$REPO_ROOT"
 
@@ -4804,6 +4952,9 @@ run_check r2i_c14 Z04 'tampered persisted nonce digest fails context_invocation_
 run_check r2i_c14 Z05 'exactly one EXIT trap, after every eligibility boundary and before context_validate/core' z05
 run_check r2i_c14 Z06 'direct NONFORMAL invocation still refuses and creates no adapter RC state' z06
 
+printf '\n----- R2I-C15 adapter canonical proof-root propagation regressions (W01) -----\n'
+run_check r2i_c15 W01 'adapter self-resolves and exports M8_PROOF_ROOT so sourced OSS helpers see the canonical root' w01
+
 printf '\n===== summary =====\n'
 printf 'R2E_B01_LEGACY_V01_V40=%s/%s\n' \
   "$((STATIC_PASS + SYNTH_PASS))" "$((STATIC_TOTAL + SYNTH_TOTAL))"
@@ -4817,6 +4968,7 @@ printf 'R2I_C11_AUTH_PATH_REGRESSIONS=%s/%s\n' "$R2I_C11_PASS" "$R2I_C11_TOTAL"
 printf 'R2I_C12_VERSIONING_CLASSIFIER_REGRESSIONS=%s/%s\n' "$R2I_C12_PASS" "$R2I_C12_TOTAL"
 printf 'R2I_C13_GETOBJECT_BYTE_EXACTNESS_REGRESSIONS=%s/%s\n' "$R2I_C13_PASS" "$R2I_C13_TOTAL"
 printf 'R2I_C14_FORMAL_CONTEXT_REGRESSIONS=%s/%s\n' "$R2I_C14_PASS" "$R2I_C14_TOTAL"
+printf 'R2I_C15_ADAPTER_PROOF_ROOT_REGRESSIONS=%s/%s\n' "$R2I_C15_PASS" "$R2I_C15_TOTAL"
 if ((${#FAILED_CHECKS[@]})); then
   printf 'R2E_B01_OFFLINE_VERIFICATION=FAIL failed=%s\n' "${FAILED_CHECKS[*]}"
   exit 1

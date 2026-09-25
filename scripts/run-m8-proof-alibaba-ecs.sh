@@ -76,6 +76,20 @@ fi
 readonly PROOF_ROOT
 [[ -n "$PROOF_ROOT" ]] || nonformal_refuse 'the proof repository root could not be resolved'
 
+# R2I-C15: publish the adapter's canonical proof root back into the process
+# environment. This establishes the canonical proof-tree contract for the sourced
+# helpers and for adapter children: scripts/lib/m8-oss.sh resolves the canonical
+# OSS config through M8_PROOF_ROOT at function-execution time, not at source time,
+# and the semantic core child must observe the same root. Previously the adapter
+# resolved PROOF_ROOT locally but left M8_PROOF_ROOT unset, so the first
+# proof-root-dependent OSS helper call failed closed with
+# "M8_PROOF_ROOT is not set; cannot resolve the canonical OSS config".
+# No new authority, no trust-target change, and no caller-selected alternative
+# root is introduced: the value published is exactly the root already resolved
+# (and confirmed non-empty) above.
+M8_PROOF_ROOT="$PROOF_ROOT"
+export M8_PROOF_ROOT
+
 readonly CORE="$PROOF_ROOT/scripts/run-m8-proof-core.sh"
 readonly EVIDENCE="$PROOF_ROOT/proof-artifacts"
 
