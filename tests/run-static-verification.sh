@@ -159,10 +159,12 @@ readonly MANIFEST_LIB="$REPO_ROOT/scripts/lib/m8-manifest.sh"
 readonly SEAMS_LIB="$REPO_ROOT/scripts/lib/m8-synthetic-seams.sh"
 readonly REQUIRED_LIST="$REPO_ROOT/scripts/lib/m8-required-artifacts.txt"
 
-# Frozen seven-spec Playwright release surface in the actual JSON reporter
-# namespace (relative to the reporter rootDir <candidate>/apps/web). This is the
-# only namespace the JSON-report contract may expect.
-readonly -a PLAYWRIGHT_FROZEN_SPECS=(
+# Frozen seven-spec Playwright release surface in its two distinct namespaces.
+# PLAYWRIGHT_INVOCATION_SPECS are the cwd-relative CLI selectors (they retain the
+# `e2e/` prefix); PLAYWRIGHT_REPORT_SPECS are the Playwright testDir-relative
+# suite.file values (no `e2e/`). Only PLAYWRIGHT_REPORT_SPECS may be expected
+# from the JSON report.
+readonly -a PLAYWRIGHT_INVOCATION_SPECS=(
   'e2e/golden-path.spec.ts'
   'e2e/unicode.spec.ts'
   'e2e/segmentation.spec.ts'
@@ -170,6 +172,15 @@ readonly -a PLAYWRIGHT_FROZEN_SPECS=(
   'e2e/lemma-annotation.spec.ts'
   'e2e/pos-annotation.spec.ts'
   'e2e/workbench-information-architecture.spec.ts'
+)
+readonly -a PLAYWRIGHT_REPORT_SPECS=(
+  'golden-path.spec.ts'
+  'unicode.spec.ts'
+  'segmentation.spec.ts'
+  'token-segmentation.spec.ts'
+  'lemma-annotation.spec.ts'
+  'pos-annotation.spec.ts'
+  'workbench-information-architecture.spec.ts'
 )
 
 # The seven production override seams owned by scripts/lib/m8-synthetic-seams.sh.
@@ -1055,9 +1066,10 @@ v26() {
 # Playwright JSON report mutations.
 #
 # The checked-in positive fixture is minimal and realistic: seven suites with
-# rootDir-relative `e2e/...` file values and 34 spec objects. Every negative
-# report is derived PROGRAMMATICALLY from it, so no near-duplicate fixture tree
-# is maintained and no impossible-path fixture can drift from the contract.
+# Playwright testDir-relative `suite.file` values (`<name>.spec.ts`) and 34 spec
+# objects. Every negative report is derived PROGRAMMATICALLY from it, so no
+# near-duplicate fixture tree is maintained and no impossible-path fixture can
+# drift from the contract.
 # ---------------------------------------------------------------------------
 mutate_playwright_report() {
   local mode=$1 out=$2
@@ -1089,10 +1101,10 @@ elif mode == "drop-spec":
     report["suites"] = report["suites"][:-1]
 elif mode == "duplicate-basename":
     extra = copy.deepcopy(report["suites"][0])
-    extra["title"] = "vendor/e2e/golden-path.spec.ts"
-    extra["file"] = "vendor/e2e/golden-path.spec.ts"
+    extra["title"] = "vendor/golden-path.spec.ts"
+    extra["file"] = "vendor/golden-path.spec.ts"
     for spec in extra["specs"]:
-        spec["file"] = "vendor/e2e/golden-path.spec.ts"
+        spec["file"] = "vendor/golden-path.spec.ts"
     report["suites"].append(extra)
 else:
     raise SystemExit("unknown Playwright mutation mode: %s" % mode)
@@ -1107,7 +1119,7 @@ v27() {
   local out="$TMPROOT/v27-out.txt"
   local -a spec_args=()
   local spec
-  for spec in "${PLAYWRIGHT_FROZEN_SPECS[@]}"; do
+  for spec in "${PLAYWRIGHT_REPORT_SPECS[@]}"; do
     spec_args+=(--spec "$spec")
   done
   "$PYTHON" "$REPO_ROOT/scripts/verify-m8-playwright-json.py" \
@@ -1115,9 +1127,11 @@ v27() {
     "${spec_args[@]}" >/dev/null || return 1
   assert_eq "$(cat "$out")" 'PLAYWRIGHT_EFFECTIVE_RETRIES=0' 'effective retries content'
   assert_eq "$(wc -c <"$out")" "$(printf 'PLAYWRIGHT_EFFECTIVE_RETRIES=0\n' | wc -c)" 'effective retries byte length'
-  # The realistic positive fixture must use the actual rootDir-relative namespace.
+  # The positive fixture must reproduce the live Playwright testDir-relative
+  # suite.file namespace, not the CLI/path namespace.
+  assert_contains "$FIXTURES/playwright-json-good.json" '"file": "golden-path.spec.ts"'
+  assert_no_contains "$FIXTURES/playwright-json-good.json" '"file": "e2e/'
   assert_no_contains "$FIXTURES/playwright-json-good.json" 'apps/web/e2e'
-  assert_contains "$FIXTURES/playwright-json-good.json" '"file": "e2e/golden-path.spec.ts"'
 }
 
 v28() {
@@ -1771,43 +1785,53 @@ c03() {
   return 0
 }
 
-# C04 — the JSON-report contract uses the reporter rootDir-relative namespace.
+# C04 — the JSON-report contract uses the Playwright testDir-relative suite.file
+# namespace (direct C15 regression).
 c04() {
   local out="$TMPROOT/c04-out.txt" report="$TMPROOT/c04-report.json" body="$TMPROOT/c04-browser"
-  local -a spec_args=() wrong_args=()
+  local -a report_args=() wrong_args=()
   local spec
-  for spec in "${PLAYWRIGHT_FROZEN_SPECS[@]}"; do
-    spec_args+=(--spec "$spec")
-    wrong_args+=(--spec "apps/web/$spec")
+  for spec in "${PLAYWRIGHT_REPORT_SPECS[@]}"; do
+    report_args+=(--spec "$spec")
   done
+  for spec in "${PLAYWRIGHT_INVOCATION_SPECS[@]}"; do
+    wrong_args+=(--spec "$spec")
+  done
+  # A. Patched positive fixture + exact testDir-relative expected specs: PASS.
   "$PYTHON" "$REPO_ROOT/scripts/verify-m8-playwright-json.py" \
     --report "$FIXTURES/playwright-json-good.json" --out "$out" \
-    "${spec_args[@]}" >/dev/null || return 1
-  # The old, wrong `apps/web/e2e/...` expectation must now FAIL.
+    "${report_args[@]}" >/dev/null || return 1
+  # B. The old, wrong `e2e/...` expectation must FAIL and leave no evidence.
   if "$PYTHON" "$REPO_ROOT/scripts/verify-m8-playwright-json.py" \
     --report "$FIXTURES/playwright-json-good.json" --out "$out" \
     "${wrong_args[@]}" >/dev/null 2>&1; then
-    printf 'apps/web/e2e expectations were accepted for a rootDir-relative report\n'
+    printf 'e2e/... expectations were accepted for a testDir-relative report\n'
     return 1
   fi
   assert_no_file "$out"
-  # A duplicated basename in another directory must not satisfy the spec set.
+  # C. An extra nested duplicate basename must not satisfy the spec set.
   mutate_playwright_report duplicate-basename "$report"
   if "$PYTHON" "$REPO_ROOT/scripts/verify-m8-playwright-json.py" \
-    --report "$report" --out "$out" "${spec_args[@]}" >/dev/null 2>&1; then
+    --report "$report" --out "$out" "${report_args[@]}" >/dev/null 2>&1; then
     printf 'a duplicated spec basename in another directory was accepted\n'
     return 1
   fi
-  # A dropped frozen spec must fail.
+  assert_no_file "$out"
+  # D. A dropped frozen spec must FAIL.
   mutate_playwright_report drop-spec "$report"
   if "$PYTHON" "$REPO_ROOT/scripts/verify-m8-playwright-json.py" \
-    --report "$report" --out "$out" "${spec_args[@]}" >/dev/null 2>&1; then
+    --report "$report" --out "$out" "${report_args[@]}" >/dev/null 2>&1; then
     printf 'a missing frozen spec was accepted\n'
     return 1
   fi
-  # Static: the core never re-prefixes the reporter namespace.
+  assert_no_file "$out"
+  # E. Static: execution uses the invocation namespace, verification uses the
+  # reporter namespace, and the core never re-prefixes, strips or widens it.
   sed -n '/^browser_e2e()/,/^}/p' "$CORE" >"$body"
+  assert_contains "$body" '"${PLAYWRIGHT_INVOCATION_SPECS[@]}"'
+  assert_contains "$body" 'for spec in "${PLAYWRIGHT_REPORT_SPECS[@]}"'
   assert_contains "$body" 'spec_args+=(--spec "$spec")'
+  assert_no_contains "$body" 'PLAYWRIGHT_SPECS'
   assert_no_contains "$body" 'apps/web/$spec'
   assert_no_contains "$body" 'apps/web/e2e'
 }
@@ -4854,7 +4878,7 @@ printf '\n----- R2E-B01 correction regressions (C01..C09) -----\n'
 run_check corr C01 'B1 token -> authorization_sha256; no issued.json self-reference' c01
 run_check corr C02 'B1 mismatched issued.json.authorization_sha256 fails closed' c02
 run_check corr C03 'B2 both production entrypoints reject all seven production override seams' c03
-run_check corr C04 'B3 JSON report uses the reporter rootDir-relative spec namespace' c04
+run_check corr C04 'B3 JSON report uses the Playwright testDir-relative suite.file namespace' c04
 run_check corr C05 'B4 every PutObject uses the official file:// body form' c05
 run_check corr C06 'B5 completeness rejects unexpected/unclassified artifacts' c06
 run_check corr C07 'B5 required-list duplicates/absolute/traversal/globs are rejected' c07

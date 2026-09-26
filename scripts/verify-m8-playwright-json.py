@@ -7,12 +7,18 @@ produced with retries disabled, that the run contains exactly the expected
 number of tests, and that the report's spec-file set equals the frozen expected
 spec set exactly.
 
-Namespace contract: the reporter runs with rootDir = `<candidate>/apps/web`, so
-the JSON reporter's suite `file` values are relative to that rootDir, e.g.
-`e2e/golden-path.spec.ts`. Expected spec paths are compared after the same
-normalization, as an exact relative-path SET. Suffix or basename matching is
-deliberately not used: it would accept `apps/web/e2e/<spec>` or a duplicated
-basename in an unrelated directory.
+Namespace contract: the frozen Product config lives at
+`<candidate>/apps/web/playwright.config.ts` and sets
+`testDir = <candidate>/apps/web/e2e`. Live Playwright 1.62.1 JSON reporter
+`suite.file` values are therefore testDir-relative, e.g.
+`golden-path.spec.ts`. Expected spec paths are already supplied in that exact
+reporter namespace and are compared as an exact relative-path SET after only
+the separator / leading `./` normalization already present; no other
+transformation is applied. The verifier never strips a prefix, never performs
+suffix or basename matching, and never accepts an alternate namespace:
+`e2e/golden-path.spec.ts`, `apps/web/e2e/golden-path.spec.ts` and a nested
+duplicate such as `vendor/golden-path.spec.ts` all remain distinct from
+`golden-path.spec.ts`.
 
 On success it atomically materializes the effective-retries evidence file.
 A failing run never creates (and never leaves behind) that output file.
@@ -48,7 +54,10 @@ def parse_args(argv):
     parser.add_argument("--expected-project", default="chromium",
                         help="the only permitted project name (default: chromium)")
     parser.add_argument("--spec", action="append", default=[],
-                        help="exact spec file path that must appear (repeatable)")
+                        help="exact Playwright testDir-relative spec file path "
+                             "that must appear in the report, e.g. "
+                             "golden-path.spec.ts; no prefix stripping, suffix "
+                             "or basename matching (repeatable)")
     parser.add_argument("--json-out", default=None,
                         help="optional machine-readable PASS summary")
     return parser.parse_args(argv)
@@ -111,7 +120,10 @@ def iter_file_values(node):
 
 
 def normalize_spec_path(value):
-    """Normalize a reporter path for exact, namespace-preserving comparison."""
+    """Normalize separators and a leading `./` only; keep the namespace exact.
+
+    No prefix stripping, suffix matching or basename extraction is performed.
+    """
     normalized = value.replace("\\", "/")
     while normalized.startswith("./"):
         normalized = normalized[2:]

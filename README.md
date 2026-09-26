@@ -466,17 +466,49 @@ npx playwright test \
   --retries=0 --fail-on-flaky-tests --reporter=list,json
 ```
 
-Exactly one `--reporter` option is used. The reporter runs with rootDir
-`<candidate>/apps/web`, so the JSON reporter's suite `file` values are relative
-to that rootDir and are exactly `e2e/<name>.spec.ts`; `apps/web/e2e/...` is never
-expected inside the JSON report. The exact JSON report is parsed with Python
-stdlib by `scripts/verify-m8-playwright-json.py`, which requires every
+Exactly one `--reporter` option is used. Two distinct namespaces are involved and
+must not be conflated.
+
+**CLI invocation namespace.** The formal core executes Playwright from
+`<candidate>/apps/web`, so the seven selectors passed to `npx playwright test`
+are cwd-relative and retain the `e2e/` prefix:
+
+```text
+e2e/golden-path.spec.ts
+e2e/unicode.spec.ts
+e2e/segmentation.spec.ts
+e2e/token-segmentation.spec.ts
+e2e/lemma-annotation.spec.ts
+e2e/pos-annotation.spec.ts
+e2e/workbench-information-architecture.spec.ts
+```
+
+**Playwright testDir-relative JSON reporter namespace.** The frozen Product
+config sets `testDir: './e2e'`, so for live Playwright 1.62.1 the JSON reporter's
+suite `file` values are testDir-relative and omit the `e2e/` prefix:
+
+```text
+golden-path.spec.ts
+unicode.spec.ts
+segmentation.spec.ts
+token-segmentation.spec.ts
+lemma-annotation.spec.ts
+pos-annotation.spec.ts
+workbench-information-architecture.spec.ts
+```
+
+The exact JSON report is parsed with Python stdlib by
+`scripts/verify-m8-playwright-json.py`, which requires every
 `config.projects[*].retries == 0`, project names `== {"chromium"}`,
 `stats.expected == 34`, `stats.unexpected == 0`, `stats.flaky == 0` and
-`stats.skipped == 0`, and that the report's normalized spec-file **set equals**
-the seven frozen spec paths exactly — never a suffix or basename match, so a
-duplicated basename elsewhere cannot be accepted. Only then is
-`playwright-effective-retries.txt` atomically written with exactly
+`stats.skipped == 0`, and that the report's spec-file set equals the seven frozen
+reporter paths exactly, as an **exact set** in that reporter namespace. The
+verifier performs no prefix stripping, no suffix matching, no basename
+extraction and no alternate-namespace acceptance: `e2e/golden-path.spec.ts`,
+`apps/web/e2e/golden-path.spec.ts` and `vendor/golden-path.spec.ts` all remain
+distinct from `golden-path.spec.ts`, so a duplicated basename elsewhere cannot be
+accepted and neither namespace is a compatibility fallback for the other. Only
+then is `playwright-effective-retries.txt` atomically written with exactly
 `PLAYWRIGHT_EFFECTIVE_RETRIES=0`. A missing, unparseable or mismatching report
 fails closed. Raw-log count guards are secondary only.
 

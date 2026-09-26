@@ -40,10 +40,18 @@ readonly EXPECTED_PLAYWRIGHT_PASSED='34'
 readonly POSTGRES_CONTAINER='linguagraph-m8-proof-postgres'
 readonly DB_URL='postgresql+psycopg://postgres:postgres@127.0.0.1:5432/postgres'
 
-# Frozen seven-spec Playwright release surface. These paths are relative to the
-# reporter rootDir ($CANDIDATE/apps/web) and are exactly the JSON reporter's
-# suite `file` namespace.
-readonly -a PLAYWRIGHT_SPECS=(
+# Frozen seven-spec Playwright release surface, held in two distinct namespaces.
+#
+# PLAYWRIGHT_INVOCATION_SPECS are the CLI selectors passed to `npx playwright
+# test`. The core executes from $CANDIDATE/apps/web, so these are cwd-relative
+# and retain the `e2e/` prefix.
+#
+# PLAYWRIGHT_REPORT_SPECS are the paths passed to
+# scripts/verify-m8-playwright-json.py. The frozen Product config sets
+# `testDir: './e2e'`, so live Playwright 1.62.1 JSON reporter `suite.file`
+# values are testDir-relative and omit the `e2e/` prefix. The verifier does no
+# prefix stripping, suffix matching or basename extraction.
+readonly -a PLAYWRIGHT_INVOCATION_SPECS=(
   'e2e/golden-path.spec.ts'
   'e2e/unicode.spec.ts'
   'e2e/segmentation.spec.ts'
@@ -51,6 +59,15 @@ readonly -a PLAYWRIGHT_SPECS=(
   'e2e/lemma-annotation.spec.ts'
   'e2e/pos-annotation.spec.ts'
   'e2e/workbench-information-architecture.spec.ts'
+)
+readonly -a PLAYWRIGHT_REPORT_SPECS=(
+  'golden-path.spec.ts'
+  'unicode.spec.ts'
+  'segmentation.spec.ts'
+  'token-segmentation.spec.ts'
+  'lemma-annotation.spec.ts'
+  'pos-annotation.spec.ts'
+  'workbench-information-architecture.spec.ts'
 )
 
 # Emit the frozen static binding for the formal wrapper. This mode must not
@@ -405,13 +422,15 @@ frontend() {
 # expected == 34, unexpected == 0, flaky == 0, skipped == 0, and that the set of
 # spec files in the report equals the seven frozen specs exactly.
 #
-# Namespace: the reporter runs with rootDir = $CANDIDATE/apps/web, so the JSON
-# reporter's suite `file` values are relative to that rootDir and are exactly
-# `e2e/<name>.spec.ts`. The expected values passed to the verifier therefore use
-# the SAME rootDir-relative namespace; `apps/web/e2e/...` is never expected
-# inside the JSON report. Only then is playwright-effective-retries.txt written,
-# with exact content PLAYWRIGHT_EFFECTIVE_RETRIES=0. Either the raw log count
-# check or the JSON check failing is fatal; the JSON check is the authority.
+# Namespace: the frozen Product config sets `testDir: './e2e'` and npx runs from
+# $CANDIDATE/apps/web. The CLI selectors therefore stay cwd-relative and retain
+# the `e2e/` prefix (PLAYWRIGHT_INVOCATION_SPECS), while live Playwright 1.62.1
+# JSON reporter `suite.file` values are testDir-relative and omit `e2e/`
+# (PLAYWRIGHT_REPORT_SPECS). The verifier compares only in that reporter
+# namespace; it does no prefix stripping, suffix matching or basename
+# extraction. Only then is playwright-effective-retries.txt written, with exact
+# content PLAYWRIGHT_EFFECTIVE_RETRIES=0. Either the raw log count check or the
+# JSON check failing is fatal; the JSON check is the authority.
 browser_e2e() {
   activate_runtimes
   export DATABASE_URL="$DB_URL" TEST_DATABASE_URL="$DB_URL"
@@ -421,7 +440,7 @@ browser_e2e() {
   npx playwright install --with-deps chromium
   rm -f "$EVIDENCE/playwright-json-report.json" "$EVIDENCE/playwright-effective-retries.txt"
   npx playwright test \
-    "${PLAYWRIGHT_SPECS[@]}" \
+    "${PLAYWRIGHT_INVOCATION_SPECS[@]}" \
     --retries=0 \
     --fail-on-flaky-tests \
     --reporter=list,json 2>&1 | tee "$EVIDENCE/playwright-raw.log"
@@ -429,8 +448,8 @@ browser_e2e() {
     die 'Playwright raw log reports skipped/flaky/failed paths'
   local -a spec_args=()
   local spec
-  for spec in "${PLAYWRIGHT_SPECS[@]}"; do
-    # PLAYWRIGHT_SPECS are already reporter-rootDir-relative; do not re-prefix.
+  for spec in "${PLAYWRIGHT_REPORT_SPECS[@]}"; do
+    # Reporter testDir-relative names; already exact, so never re-prefix.
     spec_args+=(--spec "$spec")
   done
   "$PROOF_ROOT/scripts/verify-m8-playwright-json.py" \
